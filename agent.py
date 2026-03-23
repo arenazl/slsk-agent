@@ -1,5 +1,5 @@
 """
-SoulSeek Agent - Local file management agent for SoulSeek UI.
+Groove Sync Agent - Local file management agent for Groove Sync.
 Runs as a Windows system tray application with an HTTP server on port 9900.
 """
 
@@ -34,7 +34,7 @@ AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".wav", ".aif", ".aiff",
     ".m4a", ".ogg", ".aac", ".wma", ".opus",
 }
-CONFIG_DIR = Path.home() / ".slsk-agent"
+CONFIG_DIR = Path.home() / ".groovesync"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "agent.log"
 
@@ -52,7 +52,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger("slsk-agent")
+log = logging.getLogger("groovesync")
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -455,27 +455,29 @@ async def start_server():
 
 
 def _create_tray_icon() -> Image.Image:
-    """Generate a simple tray icon programmatically."""
+    """Load the app logo for the tray icon."""
     size = 64
+    # Try to load logo.png from same directory as the script/exe
+    for logo_path in [
+        Path(getattr(sys, '_MEIPASS', '')) / "logo.png",
+        Path(__file__).parent / "logo.png",
+        Path.cwd() / "logo.png",
+    ]:
+        if logo_path.exists():
+            img = Image.open(logo_path).convert("RGBA")
+            img = img.resize((size, size), Image.LANCZOS)
+            return img
+    # Fallback: simple icon
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-
-    # Blue circle background
     draw.ellipse([4, 4, size - 4, size - 4], fill=(59, 130, 246, 255))
-
-    # White "S" letter
     try:
         font = ImageFont.truetype("arial.ttf", 36)
     except Exception:
         font = ImageFont.load_default()
-
-    bbox = draw.textbbox((0, 0), "S", font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    tx = (size - tw) / 2 - bbox[0]
-    ty = (size - th) / 2 - bbox[1]
-    draw.text((tx, ty), "S", fill=(255, 255, 255, 255), font=font)
-
+    bbox = draw.textbbox((0, 0), "G", font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]), "G", fill=(255, 255, 255, 255), font=font)
     return img
 
 
@@ -514,7 +516,7 @@ def _on_status(icon, item):
     try:
         icon.notify(
             f"Carpeta: {folder}\nPuerto: {PORT}\nVersion: {VERSION}",
-            "SoulSeek Agent",
+            "Groove Sync Agent",
         )
     except Exception:
         log.info("Status — Folder: %s, Port: %d, Version: %s", folder, PORT, VERSION)
@@ -529,9 +531,9 @@ def _on_exit(icon, item):
 def run_tray(ready_event: threading.Event):
     """Run the system tray icon (blocking, runs on its own thread)."""
     icon = pystray.Icon(
-        "slsk-agent",
+        "groovesync",
         _create_tray_icon(),
-        "SoulSeek Agent",
+        "Groove Sync Agent",
         menu=pystray.Menu(
             pystray.MenuItem("Abrir carpeta", _on_open_folder),
             pystray.MenuItem("Configurar carpeta", _on_configure_folder),
@@ -562,7 +564,7 @@ def first_run_setup():
         log.info("Initial folder set to: %s", folder)
     else:
         # Set a sensible default
-        default = str(Path.home() / "Music" / "SoulSeek")
+        default = str(Path.home() / "Music" / "GrooveSync")
         set_download_folder(default)
         log.info("No folder selected, using default: %s", default)
 
@@ -573,7 +575,7 @@ def first_run_setup():
 
 
 def main():
-    log.info("=== SoulSeek Agent v%s starting ===", VERSION)
+    log.info("=== Groove Sync Agent v%s starting ===", VERSION)
 
     # First run setup (folder picker)
     first_run_setup()
