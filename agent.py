@@ -25,6 +25,7 @@ from aiohttp import web
 VERSION = "1.0.0"
 PORT = 9900
 ALLOWED_ORIGINS = [
+    "https://groovesyncdj.netlify.app",
     "https://slsk-ui.netlify.app",
     "http://localhost:5173",
     "http://localhost:5174",
@@ -342,11 +343,21 @@ async def handle_library(request: web.Request):
 async def handle_config(request: web.Request):
     body = await request.json()
     new_folder = body.get("folder")
-    if not new_folder:
-        return web.json_response({"ok": False, "error": "Missing folder"}, status=400)
+    username = body.get("username")
 
-    set_download_folder(new_folder)
-    log.info("Download folder updated to: %s", new_folder)
+    if username:
+        config = load_config()
+        config["username"] = username
+        save_config(config)
+        log.info("Username linked: %s", username)
+
+    if new_folder:
+        set_download_folder(new_folder)
+        log.info("Download folder updated to: %s", new_folder)
+
+    if not new_folder and not username:
+        return web.json_response({"ok": False, "error": "Missing folder or username"}, status=400)
+
     return web.json_response({"ok": True})
 
 
