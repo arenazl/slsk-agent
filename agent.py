@@ -416,6 +416,74 @@ async def handle_delete(request: web.Request):
     return web.json_response({"ok": True})
 
 
+async def handle_delete_dupes(request: web.Request):
+    body = await request.json()
+    filenames = body.get("filenames", [])
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
+
+    download_dir = Path(folder)
+    manifest = load_manifest()
+    deleted_count = 0
+    deleted_files = []
+
+    for fname in filenames:
+        filepath = _find_file_in_library(fname)
+        if filepath and filepath.exists():
+            try:
+                parent = filepath.parent
+                filepath.unlink()
+                manifest.pop(fname, None)
+                deleted_count += 1
+                deleted_files.append(fname)
+                log.info("Deleted dupe: %s", filepath)
+                # Clean up empty directory
+                if parent != download_dir and not any(parent.iterdir()):
+                    parent.rmdir()
+            except Exception as e:
+                log.error("Error deleting %s: %s", fname, e)
+
+    if deleted_count > 0:
+        save_manifest(manifest)
+
+    return web.json_response({"ok": True, "deleted": deleted_count, "files": deleted_files})
+
+
+async def handle_organize(request: web.Request):
+    body = await request.json()
+    moves = body.get("moves", [])
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
+
+    download_dir = Path(folder)
+    manifest = load_manifest()
+    moved_count = 0
+
+    for move in moves:
+        fname = move.get("filename")
+        genre = move.get("genre")
+        if not fname or not genre:
+            continue
+        filepath = _find_file_in_library(fname)
+        if filepath and filepath.exists():
+            dest_dir = download_dir / genre
+            dest_dir.mkdir(exist_ok=True)
+            dest = dest_dir / filepath.name
+            if dest != filepath:
+                filepath.rename(dest)
+                if fname in manifest:
+                    manifest[fname]["genre"] = genre
+                moved_count += 1
+                log.info("Moved %s -> %s", filepath.name, genre)
+
+    if moved_count > 0:
+        save_manifest(manifest)
+
+    return web.json_response({"ok": True, "moved": moved_count})
+
+
 async def handle_open_folder(request: web.Request):
     folder = get_download_folder()
     if not folder:
@@ -652,6 +720,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/config", handle_config)
     app.router.add_post("/api/rate", handle_rate)
     app.router.add_post("/api/delete", handle_delete)
+    app.router.add_post("/api/delete-dupes", handle_delete_dupes)
+    app.router.add_post("/api/organize", handle_organize)
     app.router.add_get("/api/open-folder", handle_open_folder)
     app.router.add_get("/api/audio/{path:.+}", handle_audio)
     app.router.add_post("/api/export-set", handle_export_set)
