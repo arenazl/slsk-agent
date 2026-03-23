@@ -436,6 +436,102 @@ async def handle_open_folder(request: web.Request):
 
 
 # ---------------------------------------------------------------------------
+# Set export
+# ---------------------------------------------------------------------------
+
+
+def _upload_to_cloudinary(data, public_id: str):
+    """Upload JSON data to Cloudinary."""
+    import tempfile
+    import cloudinary
+    import cloudinary.uploader
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+    )
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+    json.dump(data, tmp, ensure_ascii=False, indent=2)
+    tmp.close()
+    cloudinary.uploader.upload(tmp.name, resource_type="raw", public_id=public_id, overwrite=True, invalidate=True)
+    os.unlink(tmp.name)
+
+
+async def handle_export_set(request: web.Request):
+    """Export a DJ set: save metadata to Cloudinary, build zip from local files."""
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
+
+    body = await request.json()
+    name = body.get("name", "set")
+    tracks = body.get("tracks", [])
+
+    if not tracks:
+        return web.json_response({"ok": False, "error": "No tracks"}, status=400)
+
+    # 1. Save set metadata to Cloudinary
+    username = load_config().get("username", "unknown")
+    set_metadata = {"name": name, "username": username, "tracks": tracks, "created": time.strftime("%Y-%m-%d %H:%M")}
+    try:
+        cloud_key = f"soulseek/sets/{username}/{name}"
+        await asyncio.get_event_loop().run_in_executor(None, _upload_to_cloudinary, set_metadata, cloud_key)
+        log.info("Set metadata uploaded to Cloudinary: %s", cloud_key)
+    except Exception as e:
+        log.error("Failed to upload set metadata: %s", e)
+
+    # 2. Copy files to exports/{name}/ and build zip
+    import zipfile
+    export_dir = Path(folder) / "exports" / name
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    zip_path = Path(folder) / "exports" / f"{name}.zip"
+    copied = 0
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+        for i, track in enumerate(tracks, 1):
+            filename = track.get("filename", "")
+            src = _find_file_in_library(filename)
+            if not src or not src.exists():
+                continue
+
+            # Numbered filename for set order
+            numbered = f"{i:02d} - {filename}"
+            dest = export_dir / numbered
+            if not dest.exists():
+                shutil.copy2(str(src), str(dest))
+
+            zf.write(str(dest), numbered)
+            copied += 1
+
+    log.info("Exported set '%s': %d/%d tracks, zip: %s", name, copied, len(tracks), zip_path)
+
+    # 3. Serve zip as download
+    if not zip_path.exists():
+        return web.json_response({"ok": False, "error": "Zip creation failed"}, status=500)
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "application/zip",
+            "Content-Disposition": f'attachment; filename="{name}.zip"',
+            "Content-Length": str(zip_path.stat().st_size),
+        },
+    )
+    await resp.prepare(request)
+
+    with open(zip_path, "rb") as f:
+        while chunk := f.read(64 * 1024):
+            await resp.write(chunk)
+
+    await resp.write_eof()
+
+    # Clean up zip (folder stays)
+    zip_path.unlink(missing_ok=True)
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Catch-all for OPTIONS preflight requests
 # ---------------------------------------------------------------------------
 
@@ -462,6 +558,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/rate", handle_rate)
     app.router.add_post("/api/delete", handle_delete)
     app.router.add_get("/api/open-folder", handle_open_folder)
+    app.router.add_post("/api/export-set", handle_export_set)
     return app
 
 
