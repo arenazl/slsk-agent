@@ -679,6 +679,9 @@ async def handle_export_set(request: web.Request):
             "Content-Type": "application/zip",
             "Content-Disposition": f'attachment; filename="{name}.zip"',
             "Content-Length": str(zip_path.stat().st_size),
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
         },
     )
     await resp.prepare(request)
