@@ -23,7 +23,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
