@@ -644,12 +644,27 @@ async def scrape_beatport_charts():
     """Scrape Beatport Top 100 and all genre charts, upload to Cloudinary."""
     import re
     import tempfile
-    from curl_cffi import requests as cffi_requests
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
 
     genre_urls = [("main", 0, "", "https://www.beatport.com/top-100")]
     for g in BEATPORT_GENRES:
         genre_urls.append((str(g["id"]), g["id"], g["slug"],
             f"https://www.beatport.com/genre/{g['slug']}/{g['id']}/top-100"))
+
+    # Start headless Chrome
+    options = Options()
+    options.add_argument('--headless=new')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--no-sandbox')
+    try:
+        driver = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options))
+    except Exception as e:
+        log.error("Could not start Chrome: %s", e)
+        return 0
 
     def parse_beatport_html(html: str) -> list:
         match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
@@ -715,27 +730,29 @@ async def scrape_beatport_charts():
             log.error("Cloudinary upload failed for %s: %s", public_id, e)
 
     scraped = 0
-    for slug, genre_id, genre_slug, url in genre_urls:
+    try:
+        for slug, genre_id, genre_slug, url in genre_urls:
+            try:
+                log.info("Scraping Beatport: %s", slug)
+                await asyncio.get_event_loop().run_in_executor(None, driver.get, url)
+                await asyncio.sleep(3)  # Wait for page to load
+                html = await asyncio.get_event_loop().run_in_executor(None, lambda: driver.page_source)
+                tracks = parse_beatport_html(html)
+                if tracks:
+                    cache_key = f"soulseek/beatport_chart_{slug}"
+                    await asyncio.get_event_loop().run_in_executor(None, upload_to_cloudinary, tracks, cache_key)
+                    scraped += 1
+                    log.info("Scraped %d tracks for %s, uploaded to Cloudinary", len(tracks), slug)
+                else:
+                    log.warning("No tracks found for %s", slug)
+                await asyncio.sleep(2)  # Delay between requests
+            except Exception as e:
+                log.error("Error scraping %s: %s", slug, e)
+    finally:
         try:
-            log.info("Scraping Beatport: %s", slug)
-            r = await asyncio.get_event_loop().run_in_executor(
-                None, lambda u=url: cffi_requests.get(u, impersonate='chrome', timeout=30)
-            )
-            if r.status_code != 200:
-                log.warning("Beatport returned %d for %s", r.status_code, slug)
-                continue
-            tracks = parse_beatport_html(r.text)
-            if tracks:
-                cache_key = f"soulseek/beatport_chart_{slug}"
-                await asyncio.get_event_loop().run_in_executor(None, upload_to_cloudinary, tracks, cache_key)
-                scraped += 1
-                log.info("Scraped %d tracks for %s, uploaded to Cloudinary", len(tracks), slug)
-            else:
-                log.warning("No tracks found for %s", slug)
-            # Small delay between requests to avoid rate limiting
-            await asyncio.sleep(2)
-        except Exception as e:
-            log.error("Error scraping %s: %s", slug, e)
+            await asyncio.get_event_loop().run_in_executor(None, driver.quit)
+        except Exception:
+            pass
 
     return scraped
 
