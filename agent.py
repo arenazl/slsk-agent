@@ -500,15 +500,23 @@ def _create_tray_icon() -> Image.Image:
 
 def _pick_folder():
     """Open a tkinter folder picker dialog and return selected path."""
-    import tkinter as tk
-    from tkinter import filedialog
+    result = [None]
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    folder = filedialog.askdirectory(title="Selecciona tu carpeta de descargas")
-    root.destroy()
-    return folder if folder else None
+    def _run():
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.focus_force()
+        folder = filedialog.askdirectory(title="Selecciona tu carpeta de descargas")
+        root.destroy()
+        result[0] = folder if folder else None
+
+    t = threading.Thread(target=_run)
+    t.start()
+    t.join(timeout=120)
+    return result[0]
 
 
 def _on_open_folder(icon, item):
