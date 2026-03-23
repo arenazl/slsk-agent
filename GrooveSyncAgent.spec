@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+import sys
 
 a = Analysis(
     ['agent.py'],
     pathex=[],
     binaries=[],
     datas=[('logo.png', '.')],
-    hiddenimports=[],
+    hiddenimports=['selenium', 'selenium.webdriver', 'selenium.webdriver.chrome', 'selenium.webdriver.chrome.service', 'selenium.webdriver.chrome.options', 'selenium.webdriver.chrome.webdriver', 'webdriver_manager', 'webdriver_manager.chrome'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -15,6 +15,8 @@ a = Analysis(
     optimize=0,
 )
 pyz = PYZ(a.pure)
+
+icon_file = ['icon.ico'] if sys.platform == 'win32' else []
 
 exe = EXE(
     pyz,
@@ -35,5 +37,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icon.ico'],
+    icon=icon_file,
 )

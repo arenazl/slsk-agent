@@ -1,0 +1,56 @@
+name: Build Agent
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: GrooveSyncAgent.exe
+          - os: macos-latest
+            artifact: GrooveSyncAgent
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller pystray pillow aiohttp cloudinary selenium webdriver-manager
+
+      - name: Build
+        run: pyinstaller GrooveSyncAgent.spec --noconfirm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ runner.os }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/agent-Windows/GrooveSyncAgent.exe
+            artifacts/agent-macOS/GrooveSyncAgent

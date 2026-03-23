@@ -345,6 +345,7 @@ async def handle_library(request: web.Request):
             "size_mb": _file_size_mb(p),
             "format": _detect_format(p.suffix),
             "manual_genre": meta.get("manual_genre", False),
+            "date_added": meta.get("date_added", p.stat().st_mtime),
         })
 
     return web.json_response(library)
@@ -427,7 +428,7 @@ async def handle_open_folder(request: web.Request):
     target.mkdir(parents=True, exist_ok=True)
 
     try:
-        os.startfile(str(target))
+        _open_path(str(target))
         log.info("Opened folder: %s", target)
     except Exception as e:
         log.exception("Failed to open folder")
@@ -720,11 +721,20 @@ def _pick_folder():
     return result[0]
 
 
+def _open_path(path):
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
 def _on_open_folder(icon, item):
     folder = get_download_folder()
     if folder:
         Path(folder).mkdir(parents=True, exist_ok=True)
-        os.startfile(folder)
+        _open_path(folder)
     else:
         _on_configure_folder(icon, item)
 
