@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.0.0"
+VERSION = "1.3.0"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -436,6 +437,84 @@ async def handle_open_folder(request: web.Request):
 
 
 # ---------------------------------------------------------------------------
+# Audio streaming
+# ---------------------------------------------------------------------------
+
+
+async def handle_audio(request: web.Request):
+    """Stream an audio file from the library."""
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"error": "No folder configured"}, status=400)
+
+    rel = request.match_info.get("path", "")
+    if not rel:
+        return web.json_response({"error": "Missing file path"}, status=400)
+
+    # Try direct path first, then search by filename
+    target = Path(folder) / rel
+    if not target.exists() or not target.is_file():
+        target = _find_file_in_library(Path(rel).name)
+        if not target or not target.exists():
+            return web.json_response({"error": "File not found"}, status=404)
+
+    content_types = {
+        ".flac": "audio/flac", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+        ".aif": "audio/aiff", ".aiff": "audio/aiff", ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg", ".aac": "audio/aac", ".opus": "audio/opus",
+    }
+    ct = content_types.get(target.suffix.lower(), "application/octet-stream")
+    file_size = target.stat().st_size
+
+    # Support Range requests for seeking
+    range_header = request.headers.get("Range", "")
+    if range_header:
+        start = 0
+        end = file_size - 1
+        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if match:
+            start = int(match.group(1))
+            if match.group(2):
+                end = int(match.group(2))
+        length = end - start + 1
+        resp = web.StreamResponse(
+            status=206,
+            headers={
+                "Content-Type": ct,
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(length),
+                "Accept-Ranges": "bytes",
+            },
+        )
+        await resp.prepare(request)
+        with open(target, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                await resp.write(chunk)
+                remaining -= len(chunk)
+    else:
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": ct,
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+            },
+        )
+        await resp.prepare(request)
+        with open(target, "rb") as f:
+            while chunk := f.read(64 * 1024):
+                await resp.write(chunk)
+
+    await resp.write_eof()
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Set export
 # ---------------------------------------------------------------------------
 
@@ -558,6 +637,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/rate", handle_rate)
     app.router.add_post("/api/delete", handle_delete)
     app.router.add_get("/api/open-folder", handle_open_folder)
+    app.router.add_get("/api/audio/{path:.+}", handle_audio)
     app.router.add_post("/api/export-set", handle_export_set)
     return app
 
