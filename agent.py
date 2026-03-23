@@ -351,11 +351,17 @@ async def handle_config(request: web.Request):
         save_config(config)
         log.info("Username linked: %s", username)
 
+    if "primary" in body:
+        config = load_config()
+        config["primary"] = bool(body["primary"])
+        save_config(config)
+        log.info("Primary agent: %s", config["primary"])
+
     if new_folder:
         set_download_folder(new_folder)
         log.info("Download folder updated to: %s", new_folder)
 
-    if not new_folder and not username:
+    if not new_folder and not username and "primary" not in body:
         return web.json_response({"ok": False, "error": "Missing folder or username"}, status=400)
 
     return web.json_response({"ok": True})
@@ -618,6 +624,21 @@ CLOUDINARY_CLOUD_NAME = "di39tigkf"
 CLOUDINARY_API_KEY = "986738179528233"
 CLOUDINARY_API_SECRET = "k1cxARGZPqw9oxn09scf8N16_oM"
 BEATPORT_SCRAPE_INTERVAL = 24 * 3600  # 24 hours
+BEATPORT_GENRES = [
+    {"name": "Tech House", "id": 11, "slug": "tech-house"},
+    {"name": "Melodic House", "id": 90, "slug": "melodic-house-techno"},
+    {"name": "Afro House", "id": 89, "slug": "afro-house"},
+    {"name": "Deep House", "id": 12, "slug": "deep-house"},
+    {"name": "Hip Hop", "id": 105, "slug": "hip-hop"},
+    {"name": "Nu Disco", "id": 50, "slug": "nu-disco-disco"},
+    {"name": "Downtempo", "id": 63, "slug": "downtempo"},
+    {"name": "Electro", "id": 94, "slug": "electro-classic-detroit-modern"},
+    {"name": "Indie Dance", "id": 37, "slug": "indie-dance"},
+    {"name": "Minimal Tech", "id": 14, "slug": "minimal-deep-tech"},
+    {"name": "Progressive House", "id": 15, "slug": "progressive-house"},
+    {"name": "Trance", "id": 7, "slug": "trance-main-floor"},
+    {"name": "Peak Time Techno", "id": 6, "slug": "techno-peak-time-driving"},
+]
 
 async def scrape_beatport_charts():
     """Scrape Beatport Top 100 and all genre charts, upload to Cloudinary."""
@@ -625,20 +646,10 @@ async def scrape_beatport_charts():
     import tempfile
     from curl_cffi import requests as cffi_requests
 
-    # Genre list from beatport_genres.json
     genre_urls = [("main", 0, "", "https://www.beatport.com/top-100")]
-
-    # Load genres from local file or Cloudinary
-    try:
-        genres_url = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/raw/upload/soulseek/beatport_genres.json"
-        r = cffi_requests.get(genres_url, impersonate='chrome', timeout=10)
-        if r.status_code == 200:
-            genres = r.json()
-            for g in genres:
-                genre_urls.append((str(g["id"]), g["id"], g["slug"],
-                    f"https://www.beatport.com/genre/{g['slug']}/{g['id']}/top-100"))
-    except Exception as e:
-        log.warning("Could not fetch genres: %s", e)
+    for g in BEATPORT_GENRES:
+        genre_urls.append((str(g["id"]), g["id"], g["slug"],
+            f"https://www.beatport.com/genre/{g['slug']}/{g['id']}/top-100"))
 
     def parse_beatport_html(html: str) -> list:
         match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
@@ -729,8 +740,17 @@ async def scrape_beatport_charts():
     return scraped
 
 
+def is_primary_agent() -> bool:
+    """Check if this agent is configured as primary (auto-scrapes charts)."""
+    config = load_config()
+    return config.get("primary", False)
+
+
 async def beatport_scrape_loop():
-    """Run Beatport scraping on startup and every 24 hours."""
+    """Run Beatport scraping on startup and every 24 hours. Only for primary agent."""
+    if not is_primary_agent():
+        log.info("Secondary agent — skipping automatic chart scraping")
+        return
     while True:
         try:
             count = await scrape_beatport_charts()
