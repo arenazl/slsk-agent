@@ -86,13 +86,7 @@ def set_download_folder(folder: str):
     Path(folder).mkdir(parents=True, exist_ok=True)
 
 
-def _load_ignore_dirs() -> set:
-    """Return set of lowercase directory names to exclude from library scan."""
-    cfg = load_config()
-    defaults = {"__cache__"}
-    custom = set(d.lower() for d in cfg.get("ignore_dirs", []))
-    # Also detect exported sets: dirs with only audio files that are copies
-    return defaults | custom
+IGNORE_DIRS = {"exports", "__cache__"}
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +311,7 @@ async def handle_library(request: web.Request):
     if not root.exists():
         return web.json_response([])
 
-    # Folders to ignore (exported sets, cache, etc.)
-    ignore_dirs = _load_ignore_dirs()
+    # Skip exported sets and cache
 
     manifest = load_manifest()
     library = []
@@ -334,7 +327,7 @@ async def handle_library(request: web.Request):
         # Skip files inside ignored directories
         rel = p.relative_to(root)
         top_dir = rel.parts[0] if len(rel.parts) > 1 else ""
-        if top_dir.lower() in ignore_dirs:
+        if top_dir.lower() in IGNORE_DIRS:
             continue
 
         genre = str(rel.parent) if str(rel.parent) != "." else ""
