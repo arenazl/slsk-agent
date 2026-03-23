@@ -441,6 +441,18 @@ async def handle_open_folder(request: web.Request):
 # ---------------------------------------------------------------------------
 
 
+def _cors_headers(request):
+    origin = request.headers.get("Origin", "")
+    h = {
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length",
+    }
+    if origin in ALLOWED_ORIGINS:
+        h["Access-Control-Allow-Origin"] = origin
+    return h
+
+
 async def handle_audio(request: web.Request):
     """Stream an audio file from the library."""
     folder = get_download_folder()
@@ -465,6 +477,7 @@ async def handle_audio(request: web.Request):
     }
     ct = content_types.get(target.suffix.lower(), "application/octet-stream")
     file_size = target.stat().st_size
+    cors = _cors_headers(request)
 
     # Support Range requests for seeking
     range_header = request.headers.get("Range", "")
@@ -480,6 +493,7 @@ async def handle_audio(request: web.Request):
         resp = web.StreamResponse(
             status=206,
             headers={
+                **cors,
                 "Content-Type": ct,
                 "Content-Range": f"bytes {start}-{end}/{file_size}",
                 "Content-Length": str(length),
@@ -500,6 +514,7 @@ async def handle_audio(request: web.Request):
         resp = web.StreamResponse(
             status=200,
             headers={
+                **cors,
                 "Content-Type": ct,
                 "Content-Length": str(file_size),
                 "Accept-Ranges": "bytes",
