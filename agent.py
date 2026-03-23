@@ -533,6 +533,30 @@ def _on_status(icon, item):
         log.info("Status — Folder: %s, Port: %d, Version: %s", folder, PORT, VERSION)
 
 
+def _on_refresh_charts(icon, item):
+    """Trigger immediate Beatport chart refresh."""
+    log.info("Manual chart refresh requested")
+    try:
+        icon.notify("Renovando charts...", "Groove Sync Agent")
+    except Exception:
+        pass
+    # Run scraping in a thread to not block the tray
+    def do_scrape():
+        loop = asyncio.new_event_loop()
+        try:
+            count = loop.run_until_complete(scrape_beatport_charts())
+            log.info("Manual scrape done: %d charts", count)
+            try:
+                icon.notify(f"Charts actualizados: {count} géneros", "Groove Sync Agent")
+            except Exception:
+                pass
+        except Exception as e:
+            log.error("Manual scrape failed: %s", e)
+        finally:
+            loop.close()
+    threading.Thread(target=do_scrape, daemon=True).start()
+
+
 def _on_exit(icon, item):
     log.info("Agent shutting down via tray menu")
     icon.stop()
@@ -548,6 +572,7 @@ def run_tray(ready_event: threading.Event):
         menu=pystray.Menu(
             pystray.MenuItem("Abrir carpeta", _on_open_folder),
             pystray.MenuItem("Configurar carpeta", _on_configure_folder),
+            pystray.MenuItem("Renovar Charts", _on_refresh_charts),
             pystray.MenuItem("Estado", _on_status),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Salir", _on_exit),
@@ -585,6 +610,136 @@ def first_run_setup():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Beatport Scraping & Cloudinary Upload
+# ---------------------------------------------------------------------------
+
+CLOUDINARY_CLOUD_NAME = "di39tigkf"
+CLOUDINARY_API_KEY = "986738179528233"
+CLOUDINARY_API_SECRET = "k1cxARGZPqw9oxn09scf8N16_oM"
+BEATPORT_SCRAPE_INTERVAL = 24 * 3600  # 24 hours
+
+async def scrape_beatport_charts():
+    """Scrape Beatport Top 100 and all genre charts, upload to Cloudinary."""
+    import re
+    import tempfile
+    from curl_cffi import requests as cffi_requests
+
+    # Genre list from beatport_genres.json
+    genre_urls = [("main", 0, "", "https://www.beatport.com/top-100")]
+
+    # Load genres from local file or Cloudinary
+    try:
+        genres_url = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/raw/upload/soulseek/beatport_genres.json"
+        r = cffi_requests.get(genres_url, impersonate='chrome', timeout=10)
+        if r.status_code == 200:
+            genres = r.json()
+            for g in genres:
+                genre_urls.append((str(g["id"]), g["id"], g["slug"],
+                    f"https://www.beatport.com/genre/{g['slug']}/{g['id']}/top-100"))
+    except Exception as e:
+        log.warning("Could not fetch genres: %s", e)
+
+    def parse_beatport_html(html: str) -> list:
+        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+        if not match:
+            return []
+        next_data = json.loads(match.group(1))
+        props = next_data.get("props", {}).get("pageProps", {})
+        chart_data = props.get("dehydratedState", {}).get("queries", [])
+        tracks = []
+        for query in chart_data:
+            state = query.get("state", {})
+            data = state.get("data", {})
+            results = data.get("results", data.get("tracks", []))
+            if not isinstance(results, list):
+                continue
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                artists = item.get("artists", [])
+                artist_names = ", ".join(a.get("name", "") for a in artists if isinstance(a, dict))
+                title = item.get("name", "")
+                mix_name = item.get("mix_name", "")
+                if mix_name and mix_name.lower() != "original":
+                    title = f"{title} ({mix_name})"
+                key_name = ""
+                key_obj = item.get("key", {})
+                if isinstance(key_obj, dict):
+                    key_name = key_obj.get("name", key_obj.get("camelot_short", ""))
+                genre_name = ""
+                genre_list = item.get("genre", [])
+                if isinstance(genre_list, list) and genre_list:
+                    genre_name = genre_list[0].get("genre_name", "") if isinstance(genre_list[0], dict) else ""
+                elif isinstance(genre_list, dict):
+                    genre_name = genre_list.get("name", "")
+                tracks.append({
+                    "id": item.get("id", 0),
+                    "title": title,
+                    "artist": artist_names,
+                    "genre": genre_name,
+                    "bpm": item.get("bpm"),
+                    "key": key_name,
+                    "label": (item.get("release", {}) or {}).get("label", {}).get("name", "") if isinstance(item.get("release"), dict) else "",
+                    "duration_ms": item.get("length_ms", 0) or item.get("length", 0),
+                    "sample_url": item.get("sample_url", "") or "",
+                    "artwork_url": (item.get("release", {}) or {}).get("image", {}).get("uri", "") if isinstance(item.get("release"), dict) else "",
+                    "position": item.get("position", 0) or item.get("number", 0),
+                })
+            if tracks:
+                break
+        return tracks
+
+    def upload_to_cloudinary(data, public_id: str):
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            cloudinary.config(cloud_name=CLOUDINARY_CLOUD_NAME, api_key=CLOUDINARY_API_KEY, api_secret=CLOUDINARY_API_SECRET)
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+            json.dump(data, tmp, ensure_ascii=False, indent=2)
+            tmp.close()
+            cloudinary.uploader.upload(tmp.name, resource_type="raw", public_id=public_id, overwrite=True, invalidate=True)
+            os.unlink(tmp.name)
+        except Exception as e:
+            log.error("Cloudinary upload failed for %s: %s", public_id, e)
+
+    scraped = 0
+    for slug, genre_id, genre_slug, url in genre_urls:
+        try:
+            log.info("Scraping Beatport: %s", slug)
+            r = await asyncio.get_event_loop().run_in_executor(
+                None, lambda u=url: cffi_requests.get(u, impersonate='chrome', timeout=30)
+            )
+            if r.status_code != 200:
+                log.warning("Beatport returned %d for %s", r.status_code, slug)
+                continue
+            tracks = parse_beatport_html(r.text)
+            if tracks:
+                cache_key = f"soulseek/beatport_chart_{slug}"
+                await asyncio.get_event_loop().run_in_executor(None, upload_to_cloudinary, tracks, cache_key)
+                scraped += 1
+                log.info("Scraped %d tracks for %s, uploaded to Cloudinary", len(tracks), slug)
+            else:
+                log.warning("No tracks found for %s", slug)
+            # Small delay between requests to avoid rate limiting
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.error("Error scraping %s: %s", slug, e)
+
+    return scraped
+
+
+async def beatport_scrape_loop():
+    """Run Beatport scraping on startup and every 24 hours."""
+    while True:
+        try:
+            count = await scrape_beatport_charts()
+            log.info("Beatport scrape complete: %d charts updated", count)
+        except Exception as e:
+            log.error("Beatport scrape error: %s", e)
+        await asyncio.sleep(BEATPORT_SCRAPE_INTERVAL)
+
+
 def main():
     log.info("=== Groove Sync Agent v%s starting ===", VERSION)
 
@@ -604,6 +759,8 @@ def main():
 
     try:
         runner = loop.run_until_complete(start_server())
+        # Start Beatport scraper in background
+        loop.create_task(beatport_scrape_loop())
         log.info("Agent ready — listening on port %d", PORT)
         loop.run_forever()
     except KeyboardInterrupt:
