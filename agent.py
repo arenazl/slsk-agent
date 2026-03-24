@@ -4,6 +4,7 @@ Runs as a Windows system tray application with an HTTP server on port 9900.
 """
 
 import asyncio
+from datetime import datetime
 import json
 import logging
 import os
@@ -312,11 +313,17 @@ async def handle_library(request: web.Request):
 
         subfolder = str(rel.parent) if str(rel.parent) != "." else ""
 
+        try:
+            mtime = datetime.fromtimestamp(p.stat().st_mtime).isoformat()
+        except Exception:
+            mtime = ""
+
         library.append({
             "filename": p.name,
             "size_mb": _file_size_mb(p),
             "format": _detect_format(p.suffix),
             "subfolder": subfolder,
+            "mtime": mtime,
         })
 
     return web.json_response(library)
