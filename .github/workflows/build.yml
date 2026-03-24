@@ -25,7 +25,7 @@ jobs:
           path: dist/GrooveSyncAgent.exe
 
   build-macos:
-    runs-on: macos-13
+    runs-on: macos-14
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
