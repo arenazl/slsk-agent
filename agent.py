@@ -666,8 +666,20 @@ async def handle_options(request: web.Request):
 # ---------------------------------------------------------------------------
 
 
+@web.middleware
+async def logging_middleware(request, handler):
+    log.info("→ %s %s (from %s)", request.method, request.path, request.headers.get("Origin", "direct"))
+    try:
+        response = await handler(request)
+        log.info("← %s %s → %s", request.method, request.path, response.status)
+        return response
+    except Exception as e:
+        log.error("← %s %s → ERROR: %s", request.method, request.path, e)
+        raise
+
+
 def create_app() -> web.Application:
-    app = web.Application(middlewares=[cors_middleware], client_max_size=500 * 1024 * 1024)  # 500 MB max upload
+    app = web.Application(middlewares=[cors_middleware, logging_middleware], client_max_size=500 * 1024 * 1024)  # 500 MB max upload
 
     # Register OPTIONS for all routes
     app.router.add_route("OPTIONS", "/{path:.*}", handle_options)
@@ -811,6 +823,90 @@ def _on_refresh_charts(icon, item):
     threading.Thread(target=do_scrape, daemon=True).start()
 
 
+def _on_view_logs(icon, item):
+    """Open log file in default text editor."""
+    log_path = str(LOG_FILE)
+    log.info("Opening log file: %s", log_path)
+    _open_path(log_path)
+
+
+def _on_update(icon, item):
+    """Check for updates and auto-update if available."""
+    log.info("Checking for updates...")
+    try:
+        icon.notify("Buscando actualizaciones...", "Groove Sync Agent")
+    except Exception:
+        pass
+
+    def do_update():
+        import urllib.request
+        try:
+            url = "https://api.github.com/repos/arenazl/slsk-agent/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "GrooveSyncAgent"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            latest = data.get("tag_name", "").lstrip("v")
+            current = VERSION
+            if latest <= current:
+                log.info("Already up to date: v%s", current)
+                try:
+                    icon.notify(f"Ya tenés la última versión (v{current})", "Groove Sync Agent")
+                except Exception:
+                    pass
+                return
+
+            log.info("New version available: v%s -> v%s", current, latest)
+            # Find Windows exe asset
+            exe_url = None
+            for asset in data.get("assets", []):
+                if asset["name"].endswith(".exe"):
+                    exe_url = asset["browser_download_url"]
+                    break
+            if not exe_url:
+                log.error("No exe found in release")
+                return
+
+            # Download to temp
+            tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "GrooveSyncAgent_update.exe"
+            log.info("Downloading update from %s", exe_url)
+            urllib.request.urlretrieve(exe_url, str(tmp_path))
+            log.info("Downloaded update to %s", tmp_path)
+
+            # Replace current exe and restart
+            current_exe = Path(sys.executable)
+            if getattr(sys, 'frozen', False):
+                # Running as compiled exe
+                bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
+                bat.write_text(f"""@echo off
+timeout /t 2 /nobreak >nul
+copy /Y "{tmp_path}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+""", encoding="utf-8")
+                log.info("Launching update script, restarting...")
+                try:
+                    icon.notify(f"Actualizando a v{latest}...", "Groove Sync Agent")
+                except Exception:
+                    pass
+                subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
+                icon.stop()
+                os._exit(0)
+            else:
+                log.info("Not running as exe, skipping self-update")
+                try:
+                    icon.notify("Actualización solo disponible en .exe", "Groove Sync Agent")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error("Update failed: %s", e)
+            try:
+                icon.notify(f"Error al actualizar: {e}", "Groove Sync Agent")
+            except Exception:
+                pass
+
+    threading.Thread(target=do_update, daemon=True).start()
+
+
 def _on_exit(icon, item):
     log.info("Agent shutting down via tray menu")
     icon.stop()
@@ -828,6 +924,9 @@ def run_tray(ready_event: threading.Event):
             pystray.MenuItem("Configurar carpeta", _on_configure_folder),
             pystray.MenuItem("Renovar Charts", _on_refresh_charts),
             pystray.MenuItem("Estado", _on_status),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Ver logs", _on_view_logs),
+            pystray.MenuItem("Actualizar", _on_update),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Salir", _on_exit),
         ),
