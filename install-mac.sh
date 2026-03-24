@@ -14,7 +14,8 @@ echo "Python3 encontrado: $(python3 --version)"
 
 # Install dependencies
 echo "Instalando dependencias..."
-pip3 install --user pystray pillow aiohttp cloudinary 2>/dev/null || pip3 install pystray pillow aiohttp cloudinary
+python3 -m pip install --upgrade pip 2>/dev/null
+python3 -m pip install pystray pillow aiohttp cloudinary
 
 # Download agent
 echo "Descargando agente..."
