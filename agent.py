@@ -577,7 +577,7 @@ def _upload_to_cloudinary(data, public_id: str):
 
 
 async def handle_export(request: web.Request):
-    """Export from library: generates .m3u with absolute paths. Optionally copies tracks."""
+    """Export from library: generates .m3u with absolute paths. Optionally copies tracks + metadata."""
     folder = get_download_folder()
     if not folder:
         return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
@@ -586,23 +586,29 @@ async def handle_export(request: web.Request):
     name = body.get("name", "set")
     files = body.get("files", [])
     include_tracks = body.get("include_tracks", False)
+    metadata = body.get("metadata", {})
 
     if not files:
         return web.json_response({"ok": False, "error": "No files"}, status=400)
 
     root = Path(folder)
-    export_dir = root / "exports" / name
-    export_dir.mkdir(parents=True, exist_ok=True)
 
     # Build .m3u with absolute paths to original files
     m3u_lines = ["#EXTM3U"]
     copied = 0
-    for i, fname in enumerate(files, 1):
-        src = _find_file_in_library(fname)
-        if not src or not src.exists():
-            continue
-        m3u_lines.append(f"#EXTINF:-1,{fname}")
-        if include_tracks:
+
+    if include_tracks:
+        export_dir = root / "exports" / name
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, fname in enumerate(files, 1):
+            src = _find_file_in_library(fname)
+            if not src or not src.exists():
+                continue
+            meta = metadata.get(fname, {})
+            artist = meta.get("artist", "")
+            title = meta.get("title", fname)
+            m3u_lines.append(f"#EXTINF:-1,{artist} - {title}" if artist else f"#EXTINF:-1,{title}")
             # Copy file with numbered prefix
             numbered = f"{i:02d} - {fname}"
             dest = export_dir / numbered
@@ -610,18 +616,43 @@ async def handle_export(request: web.Request):
                 shutil.copy2(str(src), str(dest))
             m3u_lines.append(str(dest))
             copied += 1
-        else:
+
+        # Save metadata JSON alongside
+        meta_path = export_dir / f"{name}_metadata.json"
+        export_meta = []
+        for i, fname in enumerate(files, 1):
+            meta = metadata.get(fname, {})
+            export_meta.append({"order": i, "filename": fname, **meta})
+        meta_path.write_text(json.dumps(export_meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        m3u_path = export_dir / f"{name}.m3u"
+        m3u_content = "\n".join(m3u_lines)
+        m3u_path.write_text(m3u_content, encoding="utf-8")
+        log.info("Exported '%s' with tracks: %d files to %s", name, copied, export_dir)
+        _open_path(str(export_dir))
+        return web.json_response({"ok": True, "copied": copied, "folder": str(export_dir), "m3u": str(m3u_path)})
+
+    else:
+        # M3U only — just absolute paths to originals
+        for i, fname in enumerate(files, 1):
+            src = _find_file_in_library(fname)
+            if not src or not src.exists():
+                continue
+            meta = metadata.get(fname, {})
+            artist = meta.get("artist", "")
+            title = meta.get("title", fname)
+            m3u_lines.append(f"#EXTINF:-1,{artist} - {title}" if artist else f"#EXTINF:-1,{title}")
             m3u_lines.append(str(src))
             copied += 1
 
-    m3u_path = export_dir / f"{name}.m3u"
-    m3u_path.write_text("\n".join(m3u_lines), encoding="utf-8")
-    log.info("Exported '%s': %d tracks, m3u: %s, include_tracks: %s", name, copied, m3u_path, include_tracks)
-
-    # Open the export folder
-    _open_path(str(export_dir))
-
-    return web.json_response({"ok": True, "copied": copied, "folder": str(export_dir), "m3u": str(m3u_path)})
+        m3u_content = "\n".join(m3u_lines)
+        # Also save to exports folder
+        export_dir = root / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        m3u_path = export_dir / f"{name}.m3u"
+        m3u_path.write_text(m3u_content, encoding="utf-8")
+        log.info("Exported '%s' m3u only: %d tracks", name, copied)
+        return web.json_response({"ok": True, "copied": copied, "folder": str(export_dir), "m3u": str(m3u_path), "m3u_content": m3u_content})
 
 
 async def handle_export_set(request: web.Request):
