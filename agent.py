@@ -967,7 +967,7 @@ def run_tray(ready_event: threading.Event):
     icon = pystray.Icon(
         "groovesync",
         _create_tray_icon(),
-        "Groove Sync Agent",
+        f"Groove Sync v{VERSION} - Online",
         menu=pystray.Menu(
             pystray.MenuItem("Abrir carpeta", _on_open_folder),
             pystray.MenuItem("Configurar carpeta", _on_configure_folder),
