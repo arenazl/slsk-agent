@@ -15,14 +15,15 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Build
-        run: pyinstaller GrooveSyncAgent.spec --noconfirm
+        run: pip install nuitka pystray pillow aiohttp cloudinary ordered-set zstandard
+      - name: Build with Nuitka
+        run: |
+          python -m nuitka --onefile --windows-icon-from-ico=icon.ico --company-name="GrooveSync" --product-name="GrooveSync Agent" --file-version=1.9.5 --product-version=1.9.5 --file-description="GrooveSync Local Agent" --windows-console-mode=disable --include-data-files=icon.ico=icon.ico --include-data-files=logo.png=logo.png --output-filename=GrooveSyncAgent.exe agent.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: agent-Windows
-          path: dist/GrooveSyncAgent.exe
+          path: GrooveSyncAgent.exe
 
   build-macos:
     runs-on: macos-14
@@ -34,16 +35,16 @@ jobs:
         with:
           python-version: '3.10'
       - name: Install dependencies
-        run: pip install pyinstaller pystray pillow aiohttp cloudinary
-      - name: Build
+        run: pip install nuitka pystray pillow aiohttp cloudinary ordered-set zstandard
+      - name: Build with Nuitka
         run: |
           export MACOSX_DEPLOYMENT_TARGET=11.0
-          pyinstaller GrooveSyncAgent.spec --noconfirm
+          python -m nuitka --onefile --macos-app-icon=logo.png --company-name="GrooveSync" --product-name="GrooveSync Agent" --include-data-files=logo.png=logo.png --output-filename=GrooveSyncAgent agent.py
       - name: Create .app bundle
         run: |
           APP="dist/GrooveSyncAgent.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          mv dist/GrooveSyncAgent "$APP/Contents/MacOS/GrooveSyncAgent"
+          mv GrooveSyncAgent "$APP/Contents/MacOS/GrooveSyncAgent"
           chmod +x "$APP/Contents/MacOS/GrooveSyncAgent"
 
           cat > "$APP/Contents/Info.plist" << 'PLIST'
