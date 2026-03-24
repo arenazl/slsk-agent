@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: '3.10'
       - name: Install dependencies
-        run: pip install nuitka pystray pillow aiohttp cloudinary ordered-set zstandard
+        run: pip install nuitka pystray pillow aiohttp cloudinary ordered-set zstandard imageio
       - name: Build with Nuitka
         run: |
           export MACOSX_DEPLOYMENT_TARGET=11.0
