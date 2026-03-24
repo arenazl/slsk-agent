@@ -247,22 +247,6 @@ async def handle_save_file(request: web.Request):
     dest_path.write_bytes(file_data)
     log.info("Saved file: %s", dest_path)
 
-    # Update manifest
-    entry = {
-        "title": metadata.get("title", ""),
-        "artist": metadata.get("artist", ""),
-        "genre": genre or metadata.get("genre", ""),
-        "key": metadata.get("key", ""),
-        "bpm": metadata.get("bpm"),
-        "rating": metadata.get("rating"),
-        "size_mb": _file_size_mb(dest_path),
-        "format": _detect_format(Path(filename).suffix),
-    }
-    if genre and metadata.get("genre") and genre != metadata.get("genre"):
-        entry["manual_genre"] = True
-
-    upsert_manifest(filename, entry)
-
     return web.json_response({"ok": True, "path": str(dest_path)})
 
 
@@ -297,13 +281,11 @@ async def handle_move_file(request: web.Request):
         if old_parent != Path(folder) and not any(old_parent.iterdir()):
             old_parent.rmdir()
 
-    # Update manifest
-    upsert_manifest(filename, {"genre": genre, "manual_genre": True})
-
     return web.json_response({"ok": True})
 
 
 async def handle_library(request: web.Request):
+    """Return ONLY file info: filename, size_mb, format, subfolder. No metadata."""
     folder = get_download_folder()
     if not folder:
         return web.json_response([])
@@ -312,9 +294,6 @@ async def handle_library(request: web.Request):
     if not root.exists():
         return web.json_response([])
 
-    # Skip exported sets and cache
-
-    manifest = load_manifest()
     library = []
 
     for p in root.rglob("*"):
@@ -331,21 +310,13 @@ async def handle_library(request: web.Request):
         if top_dir.lower() in IGNORE_DIRS:
             continue
 
-        genre = str(rel.parent) if str(rel.parent) != "." else ""
+        subfolder = str(rel.parent) if str(rel.parent) != "." else ""
 
-        meta = manifest.get(p.name, {})
         library.append({
             "filename": p.name,
-            "title": meta.get("title", ""),
-            "artist": meta.get("artist", ""),
-            "genre": meta.get("genre", genre),
-            "key": meta.get("key", ""),
-            "bpm": meta.get("bpm"),
-            "rating": meta.get("rating"),
             "size_mb": _file_size_mb(p),
             "format": _detect_format(p.suffix),
-            "manual_genre": meta.get("manual_genre", False),
-            "date_added": meta.get("date_added", p.stat().st_mtime),
+            "subfolder": subfolder,
         })
 
     return web.json_response(library)
@@ -379,18 +350,8 @@ async def handle_config(request: web.Request):
 
 
 async def handle_rate(request: web.Request):
-    body = await request.json()
-    filename = body.get("filename")
-    rating = body.get("rating")
-
-    if not filename:
-        return web.json_response({"ok": False, "error": "Missing filename"}, status=400)
-    if rating is None:
-        return web.json_response({"ok": False, "error": "Missing rating"}, status=400)
-
-    upsert_manifest(filename, {"rating": rating})
-    log.info("Rated %s: %s", filename, rating)
-    return web.json_response({"ok": True})
+    """Deprecated: ratings now go to Heroku/Cloudinary. Kept for backwards compat."""
+    return web.json_response({"ok": True, "deprecated": True})
 
 
 async def handle_delete(request: web.Request):
@@ -412,7 +373,6 @@ async def handle_delete(request: web.Request):
     else:
         log.warning("File not found for deletion: %s", filename)
 
-    remove_from_manifest(filename)
     return web.json_response({"ok": True})
 
 
@@ -424,7 +384,6 @@ async def handle_delete_dupes(request: web.Request):
         return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
 
     download_dir = Path(folder)
-    manifest = load_manifest()
     deleted_count = 0
     deleted_files = []
 
@@ -434,7 +393,6 @@ async def handle_delete_dupes(request: web.Request):
             try:
                 parent = filepath.parent
                 filepath.unlink()
-                manifest.pop(fname, None)
                 deleted_count += 1
                 deleted_files.append(fname)
                 log.info("Deleted dupe: %s", filepath)
@@ -443,9 +401,6 @@ async def handle_delete_dupes(request: web.Request):
                     parent.rmdir()
             except Exception as e:
                 log.error("Error deleting %s: %s", fname, e)
-
-    if deleted_count > 0:
-        save_manifest(manifest)
 
     return web.json_response({"ok": True, "deleted": deleted_count, "files": deleted_files})
 
@@ -458,7 +413,6 @@ async def handle_organize(request: web.Request):
         return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
 
     download_dir = Path(folder)
-    manifest = load_manifest()
     moved_count = 0
 
     for move in moves:
@@ -473,13 +427,8 @@ async def handle_organize(request: web.Request):
             dest = dest_dir / filepath.name
             if dest != filepath:
                 filepath.rename(dest)
-                if fname in manifest:
-                    manifest[fname]["genre"] = genre
                 moved_count += 1
                 log.info("Moved %s -> %s", filepath.name, genre)
-
-    if moved_count > 0:
-        save_manifest(manifest)
 
     return web.json_response({"ok": True, "moved": moved_count})
 
