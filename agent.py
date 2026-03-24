@@ -576,6 +576,54 @@ def _upload_to_cloudinary(data, public_id: str):
     os.unlink(tmp.name)
 
 
+async def handle_export(request: web.Request):
+    """Export from library: generates .m3u with absolute paths. Optionally copies tracks."""
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
+
+    body = await request.json()
+    name = body.get("name", "set")
+    files = body.get("files", [])
+    include_tracks = body.get("include_tracks", False)
+
+    if not files:
+        return web.json_response({"ok": False, "error": "No files"}, status=400)
+
+    root = Path(folder)
+    export_dir = root / "exports" / name
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build .m3u with absolute paths to original files
+    m3u_lines = ["#EXTM3U"]
+    copied = 0
+    for i, fname in enumerate(files, 1):
+        src = _find_file_in_library(fname)
+        if not src or not src.exists():
+            continue
+        m3u_lines.append(f"#EXTINF:-1,{fname}")
+        if include_tracks:
+            # Copy file with numbered prefix
+            numbered = f"{i:02d} - {fname}"
+            dest = export_dir / numbered
+            if not dest.exists():
+                shutil.copy2(str(src), str(dest))
+            m3u_lines.append(str(dest))
+            copied += 1
+        else:
+            m3u_lines.append(str(src))
+            copied += 1
+
+    m3u_path = export_dir / f"{name}.m3u"
+    m3u_path.write_text("\n".join(m3u_lines), encoding="utf-8")
+    log.info("Exported '%s': %d tracks, m3u: %s, include_tracks: %s", name, copied, m3u_path, include_tracks)
+
+    # Open the export folder
+    _open_path(str(export_dir))
+
+    return web.json_response({"ok": True, "copied": copied, "folder": str(export_dir), "m3u": str(m3u_path)})
+
+
 async def handle_export_set(request: web.Request):
     """Export a DJ set: save metadata to Cloudinary, build zip from local files."""
     folder = get_download_folder()
@@ -695,6 +743,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/organize", handle_organize)
     app.router.add_get("/api/open-folder", handle_open_folder)
     app.router.add_get("/api/audio/{path:.+}", handle_audio)
+    app.router.add_post("/api/export", handle_export)
     app.router.add_post("/api/export-set", handle_export_set)
     return app
 
