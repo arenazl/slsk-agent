@@ -93,7 +93,7 @@ jobs:
           path: dist/GrooveSyncAgent-macOS.zip
 
   release:
-    needs: [build-windows, build-macos]
+    needs: [build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -112,4 +112,3 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/agent-Windows/GrooveSyncAgent.exe
-            artifacts/agent-macOS/GrooveSyncAgent-macOS.zip
