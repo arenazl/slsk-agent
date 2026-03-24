@@ -26,6 +26,8 @@ jobs:
 
   build-macos:
     runs-on: macos-13
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,7 +36,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Build
-        run: pyinstaller GrooveSyncAgent.spec --noconfirm
+        run: |
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          pyinstaller GrooveSyncAgent.spec --noconfirm
       - name: Create .app bundle
         run: |
           APP="dist/GrooveSyncAgent.app"
