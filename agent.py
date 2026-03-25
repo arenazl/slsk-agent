@@ -954,7 +954,7 @@ def _on_update(icon, item):
 
             # Replace current exe and restart
             current_exe = Path(sys.executable)
-            if getattr(sys, 'frozen', False):
+            if getattr(sys, 'frozen', False) or sys.executable.endswith('.exe'):
                 # Running as compiled exe
                 bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
                 bat.write_text(f"""@echo off
