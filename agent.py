@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -198,10 +198,12 @@ async def cors_middleware(request: web.Request, handler):
 
 async def handle_status(request: web.Request):
     folder = get_download_folder()
+    ffmpeg_available = shutil.which("ffmpeg") is not None
     return web.json_response({
         "status": "ok",
         "folder": folder,
         "version": VERSION,
+        "ffmpeg": ffmpeg_available,
     })
 
 
@@ -734,6 +736,204 @@ async def handle_export_set(request: web.Request):
 
 
 # ---------------------------------------------------------------------------
+# Mix Editor endpoints
+# ---------------------------------------------------------------------------
+
+
+async def handle_track_info(request: web.Request):
+    """Return duration, sample_rate, format for a track using ffprobe."""
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"error": "No folder configured"}, status=400)
+
+    rel = request.match_info.get("path", "")
+    if not rel:
+        return web.json_response({"error": "Missing file path"}, status=400)
+
+    # Try subfolder/filename path first, then search by filename
+    target = Path(folder) / rel
+    if not target.exists() or not target.is_file():
+        target = _find_file_in_library(Path(rel).name)
+        if not target or not target.exists():
+            return web.json_response({"error": "File not found"}, status=404)
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return web.json_response({"error": "ffprobe not found"}, status=500)
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: subprocess.run(
+                [
+                    ffprobe, "-v", "quiet", "-print_format", "json",
+                    "-show_format", "-show_streams", str(target),
+                ],
+                capture_output=True, text=True, timeout=30,
+            ),
+        )
+        info = json.loads(result.stdout)
+        duration = float(info.get("format", {}).get("duration", 0))
+        # Get sample_rate from first audio stream
+        sample_rate = 44100
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                sample_rate = int(stream.get("sample_rate", 44100))
+                break
+        fmt = target.suffix.lstrip(".").upper()
+        return web.json_response({
+            "duration_seconds": round(duration, 2),
+            "sample_rate": sample_rate,
+            "format": fmt,
+        })
+    except Exception as e:
+        log.exception("ffprobe failed for %s", target)
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_mix_export(request: web.Request):
+    """Render a DJ mix using FFmpeg filter_complex (adelay + afade + amix)."""
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
+
+    body = await request.json()
+    name = body.get("name", "mix")
+    tracks = body.get("tracks", [])
+    out_format = body.get("format", "mp3")
+    bitrate = body.get("bitrate", "320k")
+
+    if not tracks:
+        return web.json_response({"ok": False, "error": "No tracks"}, status=400)
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return web.json_response({"ok": False, "error": "ffmpeg not found"}, status=500)
+
+    root = Path(folder)
+    export_dir = root / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sanitize name for filesystem
+    safe_name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    out_path = export_dir / f"{safe_name}.{out_format}"
+
+    # Resolve file paths
+    input_files = []
+    for t in tracks:
+        fname = t.get("filename", "")
+        subfolder = t.get("subfolder", "")
+        # Try subfolder/filename first
+        if subfolder:
+            candidate = root / subfolder / fname
+            if candidate.exists():
+                input_files.append((str(candidate), t))
+                continue
+        found = _find_file_in_library(fname)
+        if found and found.exists():
+            input_files.append((str(found), t))
+        else:
+            log.warning("Mix export: file not found: %s", fname)
+            return web.json_response({"ok": False, "error": f"File not found: {fname}"}, status=404)
+
+    # Build FFmpeg command with filter_complex
+    cmd = [ffmpeg_bin, "-y"]
+
+    # Add inputs
+    for filepath, _ in input_files:
+        cmd.extend(["-i", filepath])
+
+    # Build filter_complex
+    n = len(input_files)
+    filter_parts = []
+    mix_inputs = []
+
+    for i, (_, t) in enumerate(input_files):
+        start_ms = int(t.get("start_time", 0) * 1000)
+        duration = t.get("duration", 0)
+        fade_in = t.get("fade_in", 0)
+        fade_out = t.get("fade_out", 0)
+        label = f"a{i}"
+
+        parts = []
+        # Delay to position track at start_time
+        if start_ms > 0:
+            parts.append(f"adelay={start_ms}|{start_ms}")
+        # Fade in
+        if fade_in > 0:
+            parts.append(f"afade=t=in:st={t.get('start_time', 0)}:d={fade_in}")
+        # Fade out
+        if fade_out > 0 and duration > 0:
+            fade_out_start = t.get("start_time", 0) + duration - fade_out
+            parts.append(f"afade=t=out:st={fade_out_start}:d={fade_out}")
+
+        if parts:
+            filter_chain = ",".join(parts)
+            filter_parts.append(f"[{i}:a]{filter_chain}[{label}]")
+        else:
+            filter_parts.append(f"[{i}:a]acopy[{label}]")
+        mix_inputs.append(f"[{label}]")
+
+    # Mix all streams
+    mix_input_str = "".join(mix_inputs)
+    filter_parts.append(f"{mix_input_str}amix=inputs={n}:duration=longest:dropout_transition=2[out]")
+
+    filter_complex = ";".join(filter_parts)
+    cmd.extend(["-filter_complex", filter_complex, "-map", "[out]"])
+
+    # Output options
+    if out_format == "mp3":
+        cmd.extend(["-codec:a", "libmp3lame", "-b:a", bitrate])
+    elif out_format == "flac":
+        cmd.extend(["-codec:a", "flac"])
+    elif out_format == "wav":
+        cmd.extend(["-codec:a", "pcm_s16le"])
+    else:
+        cmd.extend(["-codec:a", "libmp3lame", "-b:a", bitrate])
+
+    cmd.append(str(out_path))
+
+    log.info("Mix export command: %s", " ".join(cmd[:6]) + " ... (filter_complex truncated)")
+    log.info("Mix export: %d tracks -> %s", n, out_path)
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=600),
+        )
+        if result.returncode != 0:
+            log.error("FFmpeg stderr: %s", result.stderr[-1000:] if result.stderr else "")
+            return web.json_response({"ok": False, "error": f"FFmpeg failed: {result.stderr[-500:]}"}, status=500)
+
+        # Get output duration
+        out_duration = 0
+        try:
+            probe_result = subprocess.run(
+                [shutil.which("ffprobe") or "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(out_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            probe_info = json.loads(probe_result.stdout)
+            out_duration = float(probe_info.get("format", {}).get("duration", 0))
+        except Exception:
+            pass
+
+        # Open exports folder
+        _open_path(str(export_dir))
+
+        log.info("Mix exported: %s (%.1f seconds)", out_path, out_duration)
+        return web.json_response({
+            "ok": True,
+            "file": str(out_path),
+            "duration": round(out_duration, 2),
+        })
+    except subprocess.TimeoutExpired:
+        return web.json_response({"ok": False, "error": "FFmpeg timed out (10 min limit)"}, status=500)
+    except Exception as e:
+        log.exception("Mix export failed")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+# ---------------------------------------------------------------------------
 # Refresh charts endpoint (once per day)
 # ---------------------------------------------------------------------------
 
@@ -802,6 +1002,8 @@ def create_app() -> web.Application:
     app.router.add_get("/api/audio/{path:.+}", handle_audio)
     app.router.add_post("/api/export", handle_export)
     app.router.add_post("/api/export-set", handle_export_set)
+    app.router.add_get("/api/track-info/{path:.+}", handle_track_info)
+    app.router.add_post("/api/mix-export", handle_mix_export)
     app.router.add_post("/api/refresh-charts", handle_refresh_charts)
     return app
 
