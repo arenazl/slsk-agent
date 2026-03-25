@@ -185,7 +185,8 @@ async def cors_middleware(request: web.Request, handler):
     if origin in ALLOWED_ORIGINS:
         resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Access-Control-Request-Private-Network"
+    resp.headers["Access-Control-Allow-Private-Network"] = "true"
     resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
 
