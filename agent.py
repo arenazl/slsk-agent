@@ -733,6 +733,31 @@ async def handle_export_set(request: web.Request):
 
 
 # ---------------------------------------------------------------------------
+# Refresh charts endpoint (once per day)
+# ---------------------------------------------------------------------------
+
+async def handle_refresh_charts(request: web.Request):
+    """Trigger Beatport scraping if not done in last 24h."""
+    config = load_config()
+    last_scraped = config.get("last_scraped", "")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if last_scraped == today:
+        log.info("Charts already scraped today, skipping")
+        return web.json_response({"ok": True, "skipped": True, "message": "Already scraped today"})
+
+    log.info("Starting chart scrape via HTTP endpoint")
+    try:
+        count = await scrape_beatport_charts()
+        config["last_scraped"] = today
+        save_config(config)
+        log.info("Scrape done: %d charts", count)
+        return web.json_response({"ok": True, "scraped": count})
+    except Exception as e:
+        log.error("Scrape failed: %s", e)
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+# ---------------------------------------------------------------------------
 # Catch-all for OPTIONS preflight requests
 # ---------------------------------------------------------------------------
 
@@ -776,6 +801,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/audio/{path:.+}", handle_audio)
     app.router.add_post("/api/export", handle_export)
     app.router.add_post("/api/export-set", handle_export_set)
+    app.router.add_post("/api/refresh-charts", handle_refresh_charts)
     return app
 
 
