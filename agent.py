@@ -987,14 +987,26 @@ async def handle_mix_export(request: web.Request):
     filter_parts = []
     mix_inputs = []
 
+    master_bpm = data.get("master_bpm", 0)
+
     for i, (_, t) in enumerate(input_files):
         start_ms = int(t.get("start_time", 0) * 1000)
         duration = t.get("duration", 0)
         fade_in = t.get("fade_in", 0)
         fade_out = t.get("fade_out", 0)
+        track_bpm = t.get("bpm", 0)
         label = f"a{i}"
 
         parts = []
+        # Time-stretch to master BPM using atempo
+        if master_bpm > 0 and track_bpm > 0 and track_bpm != master_bpm:
+            # atempo = original_bpm / target_bpm (speed up or slow down)
+            tempo_ratio = track_bpm / master_bpm
+            # ffmpeg atempo only accepts 0.5-100.0, chain for extreme values
+            if 0.5 <= tempo_ratio <= 100.0:
+                parts.append(f"atempo={tempo_ratio:.6f}")
+            elif tempo_ratio < 0.5:
+                parts.append(f"atempo=0.5,atempo={tempo_ratio / 0.5:.6f}")
         # Delay to position track at start_time
         if start_ms > 0:
             parts.append(f"adelay={start_ms}|{start_ms}")
