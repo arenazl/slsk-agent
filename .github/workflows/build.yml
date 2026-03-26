@@ -26,66 +26,31 @@ jobs:
           path: GrooveSyncAgent.exe
 
   build-macos:
-    runs-on: macos-14
-    env:
-      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
       - name: Install dependencies
-        run: pip install nuitka pystray pillow aiohttp cloudinary ordered-set zstandard imageio
-      - name: Build with Nuitka
+        run: pip install pyinstaller rumps pystray pillow aiohttp cloudinary selenium webdriver-manager
+      - name: Create menubar icon
         run: |
-          export MACOSX_DEPLOYMENT_TARGET=11.0
-          python -m nuitka --onefile --assume-yes-for-downloads --enable-plugin=tk-inter --macos-app-icon=logo.png --company-name="GrooveSync" --product-name="GrooveSync Agent" --include-data-files=logo.png=logo.png --output-filename=GrooveSyncAgent agent.py
-      - name: Create .app bundle
-        run: |
-          APP="dist/GrooveSyncAgent.app"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          mv GrooveSyncAgent "$APP/Contents/MacOS/GrooveSyncAgent"
-          chmod +x "$APP/Contents/MacOS/GrooveSyncAgent"
-
-          cat > "$APP/Contents/Info.plist" << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>GrooveSyncAgent</string>
-            <key>CFBundleDisplayName</key>
-            <string>GrooveSync Agent</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.groovesync.agent</string>
-            <key>CFBundleVersion</key>
-            <string>1.0</string>
-            <key>CFBundleExecutable</key>
-            <string>GrooveSyncAgent</string>
-            <key>LSUIElement</key>
-            <true/>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-          </dict>
-          </plist>
-          PLIST
-
-          if [ -f logo.png ]; then
-            mkdir -p icon.iconset
-            sips -z 512 512 logo.png --out icon.iconset/icon_512x512.png 2>/dev/null || true
-            sips -z 256 256 logo.png --out icon.iconset/icon_256x256.png 2>/dev/null || true
-            sips -z 128 128 logo.png --out icon.iconset/icon_128x128.png 2>/dev/null || true
-            iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns" 2>/dev/null || true
-          fi
-
-      - name: Ad-hoc codesign
-        run: codesign --force --deep --sign - dist/GrooveSyncAgent.app
-
+          python -c "
+          from PIL import Image
+          img = Image.open('logo_transparent.png').convert('RGBA')
+          w, h = img.size
+          s = min(w, h)
+          left = (w - s) // 2
+          top = (h - s) // 2
+          img = img.crop((left, top, left + s, top + s))
+          img = img.resize((44, 44), Image.LANCZOS)
+          img.save('menubar_icon.png')
+          "
+      - name: Build with PyInstaller
+        run: pyinstaller -y GrooveSyncAgent.spec
       - name: Zip .app bundle
         run: cd dist && zip -r GrooveSyncAgent-macOS.zip GrooveSyncAgent.app
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -93,7 +58,7 @@ jobs:
           path: dist/GrooveSyncAgent-macOS.zip
 
   release:
-    needs: [build-windows]
+    needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -112,3 +77,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/agent-Windows/GrooveSyncAgent.exe
+            artifacts/agent-macOS/GrooveSyncAgent-macOS.zip

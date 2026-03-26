@@ -1026,7 +1026,6 @@ async def start_server():
 def _create_tray_icon() -> Image.Image:
     """Load the app logo for the tray icon."""
     size = 64
-    # Try to load logo.png from same directory as the script/exe
     for logo_path in [
         Path(getattr(sys, '_MEIPASS', '')) / "logo.png",
         Path(__file__).parent / "logo.png",
@@ -1036,7 +1035,6 @@ def _create_tray_icon() -> Image.Image:
             img = Image.open(logo_path).convert("RGBA")
             img = img.resize((size, size), Image.LANCZOS)
             return img
-    # Fallback: simple icon
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([4, 4, size - 4, size - 4], fill=(59, 130, 246, 255))
@@ -1051,24 +1049,38 @@ def _create_tray_icon() -> Image.Image:
 
 
 def _pick_folder():
-    """Open a tkinter folder picker dialog and return selected path."""
-    result = [None]
-
-    def _run():
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        root.focus_force()
-        folder = filedialog.askdirectory(title="Selecciona tu carpeta de descargas")
-        root.destroy()
-        result[0] = folder if folder else None
-
-    t = threading.Thread(target=_run)
-    t.start()
-    t.join(timeout=120)
-    return result[0]
+    """Open a folder picker dialog and return selected path."""
+    if sys.platform == "darwin":
+        try:
+            script = (
+                'set theFolder to POSIX path of '
+                '(choose folder with prompt "Selecciona tu carpeta de descargas")'
+            )
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().rstrip("/")
+            return None
+        except Exception:
+            return None
+    else:
+        result = [None]
+        def _run():
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            root.focus_force()
+            folder = filedialog.askdirectory(title="Selecciona tu carpeta de descargas")
+            root.destroy()
+            result[0] = folder if folder else None
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join(timeout=120)
+        return result[0]
 
 
 def _open_path(path):
@@ -1079,6 +1091,213 @@ def _open_path(path):
     else:
         subprocess.Popen(["xdg-open", path])
 
+
+def _do_check_update(notify_fn=None):
+    """Check for updates. notify_fn(msg) is called to show messages."""
+    import urllib.request
+    if notify_fn is None:
+        notify_fn = lambda msg: None
+    try:
+        url = "https://api.github.com/repos/arenazl/slsk-agent/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "GrooveSyncAgent"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        latest = data.get("tag_name", "").lstrip("v")
+        current = VERSION
+        if latest <= current:
+            log.info("Already up to date: v%s", current)
+            notify_fn(f"Ya tenés la última versión (v{current})")
+            return
+
+        log.info("New version available: v%s -> v%s", current, latest)
+
+        if sys.platform == "darwin":
+            import zipfile
+            # Find macOS zip asset in release
+            zip_url = None
+            for asset in data.get("assets", []):
+                if asset["name"].endswith("-macOS.zip"):
+                    zip_url = asset["browser_download_url"]
+                    break
+            if not zip_url:
+                log.error("No macOS zip found in release")
+                notify_fn("No se encontró build de macOS en el release")
+                return
+
+            tmp_zip = Path("/tmp") / "GrooveSyncAgent-macOS.zip"
+            tmp_extract = Path("/tmp") / "GrooveSyncAgent_update"
+            log.info("Downloading update from %s", zip_url)
+            notify_fn(f"Descargando v{latest}...")
+            urllib.request.urlretrieve(zip_url, str(tmp_zip))
+
+            # Extract zip
+            if tmp_extract.exists():
+                shutil.rmtree(tmp_extract)
+            with zipfile.ZipFile(str(tmp_zip), 'r') as zf:
+                zf.extractall(str(tmp_extract))
+            tmp_zip.unlink(missing_ok=True)
+
+            # Find current .app location and replace it
+            if getattr(sys, 'frozen', False):
+                # Running as compiled .app bundle
+                current_app = Path(sys.executable).resolve().parent.parent.parent
+                new_app = tmp_extract / "GrooveSyncAgent.app"
+                if new_app.exists() and current_app.name.endswith(".app"):
+                    # Use a shell script to replace after exit
+                    update_sh = Path("/tmp") / "groovesync_update.sh"
+                    update_sh.write_text(f"""#!/bin/bash
+sleep 2
+rm -rf "{current_app}"
+cp -R "{new_app}" "{current_app}"
+open "{current_app}"
+rm -rf "{tmp_extract}"
+rm -f "$0"
+""", encoding="utf-8")
+                    update_sh.chmod(0o755)
+                    log.info("Launching update script, restarting...")
+                    notify_fn(f"Actualizando a v{latest}...")
+                    subprocess.Popen(["/bin/bash", str(update_sh)])
+                    os._exit(0)
+                else:
+                    log.error("Could not determine .app path for update")
+                    notify_fn("Error: no se pudo determinar la ubicación de la app")
+                    shutil.rmtree(tmp_extract, ignore_errors=True)
+            else:
+                log.info("Not running as .app bundle, skipping self-update")
+                notify_fn("Actualización solo disponible en .app compilado")
+                shutil.rmtree(tmp_extract, ignore_errors=True)
+        else:
+            exe_url = None
+            for asset in data.get("assets", []):
+                if asset["name"].endswith(".exe"):
+                    exe_url = asset["browser_download_url"]
+                    break
+            if not exe_url:
+                log.error("No exe found in release")
+                return
+
+            tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "GrooveSyncAgent_update.exe"
+            log.info("Downloading update from %s", exe_url)
+            urllib.request.urlretrieve(exe_url, str(tmp_path))
+            log.info("Downloaded update to %s", tmp_path)
+
+            current_exe = Path(sys.executable)
+            if getattr(sys, 'frozen', False) or sys.executable.endswith('.exe'):
+                bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
+                bat.write_text(f"""@echo off
+timeout /t 2 /nobreak >nul
+copy /Y "{tmp_path}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+""", encoding="utf-8")
+                log.info("Launching update script, restarting...")
+                notify_fn(f"Actualizando a v{latest}...")
+                subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
+                os._exit(0)
+            else:
+                log.info("Not running as exe, skipping self-update")
+                notify_fn("Actualización solo disponible en .exe")
+    except Exception as e:
+        log.error("Update failed: %s", e)
+        notify_fn(f"Error al actualizar: {e}")
+
+
+# ---------------------------------------------------------------------------
+# macOS tray (rumps)
+# ---------------------------------------------------------------------------
+
+if sys.platform == "darwin":
+    import rumps
+
+    class GrooveSyncMacApp(rumps.App):
+        def __init__(self):
+            icon_path = None
+            for p in [
+                Path(getattr(sys, '_MEIPASS', '')) / "menubar_icon.png",
+                Path(__file__).parent / "menubar_icon.png",
+                Path(getattr(sys, '_MEIPASS', '')) / "logo_transparent.png",
+                Path(__file__).parent / "logo_transparent.png",
+                Path(getattr(sys, '_MEIPASS', '')) / "logo.png",
+                Path(__file__).parent / "logo.png",
+            ]:
+                if p.exists():
+                    icon_path = str(p)
+                    break
+            super().__init__(
+                "Groove Sync",
+                icon=icon_path,
+                quit_button=None,
+            )
+            self.menu = [
+                rumps.MenuItem("Abrir carpeta", callback=self.on_open_folder),
+                rumps.MenuItem("Configurar carpeta", callback=self.on_configure_folder),
+                rumps.separator,
+                rumps.MenuItem("Renovar Charts", callback=self.on_refresh_charts),
+                rumps.MenuItem("Estado", callback=self.on_status),
+                rumps.separator,
+                rumps.MenuItem("Ver logs", callback=self.on_view_logs),
+                rumps.MenuItem("Actualizar", callback=self.on_update),
+                rumps.separator,
+                rumps.MenuItem("Salir", callback=self.on_quit),
+            ]
+
+        def on_open_folder(self, _):
+            folder = get_download_folder()
+            if folder:
+                Path(folder).mkdir(parents=True, exist_ok=True)
+                _open_path(folder)
+            else:
+                self.on_configure_folder(_)
+
+        def on_configure_folder(self, _):
+            folder = _pick_folder()
+            if folder:
+                set_download_folder(folder)
+                log.info("Folder configured via tray: %s", folder)
+
+        def on_status(self, _):
+            folder = get_download_folder() or "(no configurada)"
+            rumps.notification(
+                "Groove Sync Agent",
+                f"v{VERSION} - Puerto {PORT}",
+                f"Carpeta: {folder}",
+            )
+
+        def on_refresh_charts(self, _):
+            log.info("Manual chart refresh requested")
+            rumps.notification("Groove Sync Agent", "", "Renovando charts...")
+            def do_scrape():
+                loop = asyncio.new_event_loop()
+                try:
+                    count = loop.run_until_complete(scrape_beatport_charts())
+                    log.info("Manual scrape done: %d charts", count)
+                    rumps.notification("Groove Sync Agent", "", f"Charts actualizados: {count} géneros")
+                except Exception as e:
+                    log.error("Manual scrape failed: %s", e)
+                finally:
+                    loop.close()
+            threading.Thread(target=do_scrape, daemon=True).start()
+
+        def on_view_logs(self, _):
+            _open_path(str(LOG_FILE))
+
+        def on_update(self, _):
+            log.info("Checking for updates...")
+            def do():
+                _do_check_update(
+                    notify_fn=lambda msg: rumps.notification("Groove Sync Agent", "", msg)
+                )
+            threading.Thread(target=do, daemon=True).start()
+
+        def on_quit(self, _):
+            log.info("Agent shutting down via tray menu")
+            rumps.quit_application()
+            os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Windows/Linux tray (pystray)
+# ---------------------------------------------------------------------------
 
 def _on_open_folder(icon, item):
     folder = get_download_folder()
@@ -1097,7 +1316,6 @@ def _on_configure_folder(icon, item):
 
 
 def _on_status(icon, item):
-    """Show a simple status notification."""
     folder = get_download_folder() or "(no configurada)"
     try:
         icon.notify(
@@ -1109,13 +1327,11 @@ def _on_status(icon, item):
 
 
 def _on_refresh_charts(icon, item):
-    """Trigger immediate Beatport chart refresh."""
     log.info("Manual chart refresh requested")
     try:
         icon.notify("Renovando charts...", "Groove Sync Agent")
     except Exception:
         pass
-    # Run scraping in a thread to not block the tray
     def do_scrape():
         loop = asyncio.new_event_loop()
         try:
@@ -1133,87 +1349,23 @@ def _on_refresh_charts(icon, item):
 
 
 def _on_view_logs(icon, item):
-    """Open log file in default text editor."""
-    log_path = str(LOG_FILE)
-    log.info("Opening log file: %s", log_path)
-    _open_path(log_path)
+    _open_path(str(LOG_FILE))
 
 
 def _on_update(icon, item):
-    """Check for updates and auto-update if available."""
     log.info("Checking for updates...")
     try:
         icon.notify("Buscando actualizaciones...", "Groove Sync Agent")
     except Exception:
         pass
-
-    def do_update():
-        import urllib.request
-        try:
-            url = "https://api.github.com/repos/arenazl/slsk-agent/releases/latest"
-            req = urllib.request.Request(url, headers={"User-Agent": "GrooveSyncAgent"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            latest = data.get("tag_name", "").lstrip("v")
-            current = VERSION
-            if latest <= current:
-                log.info("Already up to date: v%s", current)
-                try:
-                    icon.notify(f"Ya tenés la última versión (v{current})", "Groove Sync Agent")
-                except Exception:
-                    pass
-                return
-
-            log.info("New version available: v%s -> v%s", current, latest)
-            # Find Windows exe asset
-            exe_url = None
-            for asset in data.get("assets", []):
-                if asset["name"].endswith(".exe"):
-                    exe_url = asset["browser_download_url"]
-                    break
-            if not exe_url:
-                log.error("No exe found in release")
-                return
-
-            # Download to temp
-            tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "GrooveSyncAgent_update.exe"
-            log.info("Downloading update from %s", exe_url)
-            urllib.request.urlretrieve(exe_url, str(tmp_path))
-            log.info("Downloaded update to %s", tmp_path)
-
-            # Replace current exe and restart
-            current_exe = Path(sys.executable)
-            if getattr(sys, 'frozen', False) or sys.executable.endswith('.exe'):
-                # Running as compiled exe
-                bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
-                bat.write_text(f"""@echo off
-timeout /t 2 /nobreak >nul
-copy /Y "{tmp_path}" "{current_exe}"
-start "" "{current_exe}"
-del "%~f0"
-""", encoding="utf-8")
-                log.info("Launching update script, restarting...")
-                try:
-                    icon.notify(f"Actualizando a v{latest}...", "Groove Sync Agent")
-                except Exception:
-                    pass
-                subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
-                icon.stop()
-                os._exit(0)
-            else:
-                log.info("Not running as exe, skipping self-update")
-                try:
-                    icon.notify("Actualización solo disponible en .exe", "Groove Sync Agent")
-                except Exception:
-                    pass
-        except Exception as e:
-            log.error("Update failed: %s", e)
+    def do():
+        def notify_fn(msg):
             try:
-                icon.notify(f"Error al actualizar: {e}", "Groove Sync Agent")
+                icon.notify(msg, "Groove Sync Agent")
             except Exception:
                 pass
-
-    threading.Thread(target=do_update, daemon=True).start()
+        _do_check_update(notify_fn)
+    threading.Thread(target=do, daemon=True).start()
 
 
 def _on_exit(icon, item):
@@ -1223,7 +1375,7 @@ def _on_exit(icon, item):
 
 
 def run_tray(ready_event: threading.Event):
-    """Run the system tray icon (blocking, runs on its own thread)."""
+    """Run the pystray icon (Windows/Linux only)."""
     icon = pystray.Icon(
         "groovesync",
         _create_tray_icon(),
@@ -1240,7 +1392,6 @@ def run_tray(ready_event: threading.Event):
             pystray.MenuItem("Salir", _on_exit),
         ),
     )
-
     ready_event.set()
     icon.run()
 
@@ -1433,35 +1584,57 @@ async def beatport_scrape_loop():
         await asyncio.sleep(BEATPORT_SCRAPE_INTERVAL)
 
 
+def _run_server_in_thread():
+    """Run the async HTTP server in a background thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        runner = loop.run_until_complete(start_server())
+        loop.create_task(beatport_scrape_loop())
+        log.info("Agent ready — listening on port %d", PORT)
+        loop.run_forever()
+    except Exception as e:
+        log.error("Server error: %s", e)
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
 def main():
     log.info("=== Groove Sync Agent v%s starting ===", VERSION)
 
     # First run setup (folder picker)
     first_run_setup()
 
-    # Start tray icon in a separate thread
-    tray_ready = threading.Event()
-    tray_thread = threading.Thread(target=run_tray, args=(tray_ready,), daemon=True)
-    tray_thread.start()
-    tray_ready.wait()
-    log.info("System tray icon active")
+    if sys.platform == "darwin":
+        # macOS: rumps (AppKit) MUST run on the main thread
+        server_thread = threading.Thread(target=_run_server_in_thread, daemon=True)
+        server_thread.start()
+        log.info("HTTP server started in background thread")
 
-    # Run the async HTTP server on the main thread's event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+        app = GrooveSyncMacApp()
+        app.run()  # blocks main thread
+    else:
+        # Windows/Linux: tray in thread, server on main thread
+        tray_ready = threading.Event()
+        tray_thread = threading.Thread(target=run_tray, args=(tray_ready,), daemon=True)
+        tray_thread.start()
+        tray_ready.wait()
+        log.info("System tray icon active")
 
-    try:
-        runner = loop.run_until_complete(start_server())
-        # Start Beatport scraper in background
-        loop.create_task(beatport_scrape_loop())
-        log.info("Agent ready — listening on port %d", PORT)
-        loop.run_forever()
-    except KeyboardInterrupt:
-        log.info("Interrupted")
-    finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-        log.info("Agent stopped")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            runner = loop.run_until_complete(start_server())
+            loop.create_task(beatport_scrape_loop())
+            log.info("Agent ready — listening on port %d", PORT)
+            loop.run_forever()
+        except KeyboardInterrupt:
+            log.info("Interrupted")
+        finally:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+            log.info("Agent stopped")
 
 
 if __name__ == "__main__":

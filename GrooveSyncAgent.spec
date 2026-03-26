@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-import sys
+
 
 a = Analysis(
     ['agent.py'],
     pathex=[],
     binaries=[],
-    datas=[('logo.png', '.')],
-    hiddenimports=['selenium', 'selenium.webdriver', 'selenium.webdriver.chrome', 'selenium.webdriver.chrome.service', 'selenium.webdriver.chrome.options', 'selenium.webdriver.chrome.webdriver', 'webdriver_manager', 'webdriver_manager.chrome'],
+    datas=[('logo.png', '.'), ('logo_transparent.png', '.'), ('menubar_icon.png', '.')],
+    hiddenimports=['rumps'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -16,14 +16,11 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-icon_file = ['icon.ico'] if sys.platform == 'win32' else []
-
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='GrooveSyncAgent',
     debug=False,
     bootloader_ignore_signals=False,
@@ -37,5 +34,24 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=icon_file,
+    icon=['logo.png'],
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='GrooveSyncAgent',
+)
+app = BUNDLE(
+    coll,
+    name='GrooveSyncAgent.app',
+    icon='logo.png',
+    bundle_identifier='com.groovesync.agent',
+    info_plist={
+        'LSUIElement': True,
+        'CFBundleShortVersionString': '2.5.0',
+    },
 )
