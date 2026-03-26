@@ -791,6 +791,9 @@ async def handle_track_info(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+_analysis_cache = {}  # path -> { intro_end, outro_start, duration }
+
+
 async def handle_track_analysis(request: web.Request):
     """Analyze a track's energy envelope to detect intro/outro boundaries.
 
@@ -805,6 +808,10 @@ async def handle_track_analysis(request: web.Request):
     rel = request.match_info.get("path", "")
     if not rel:
         return web.json_response({"error": "Missing file path"}, status=400)
+
+    # Check cache first
+    if rel in _analysis_cache:
+        return web.json_response(_analysis_cache[rel])
 
     target = Path(folder) / rel
     if not target.exists() or not target.is_file():
@@ -910,6 +917,7 @@ async def handle_track_analysis(request: web.Request):
 
     try:
         result = await asyncio.get_event_loop().run_in_executor(None, analyze, target)
+        _analysis_cache[rel] = result
         return web.json_response(result)
     except Exception as e:
         log.exception("track-analysis failed for %s", target)
