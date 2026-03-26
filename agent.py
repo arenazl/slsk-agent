@@ -1096,50 +1096,121 @@ async def handle_refresh_charts(request: web.Request):
 # ---------------------------------------------------------------------------
 
 async def handle_restart(request: web.Request):
-    """Restart the agent process (git pull + re-launch)."""
-    folder = Path(__file__).resolve().parent
+    """Check for update from GitHub Releases, download if available, and restart."""
+    import urllib.request
 
-    # Git pull latest code
-    pull_result = ""
+    update_msg = ""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "pull", "--ff-only",
-            cwd=str(folder),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        pull_result = (stdout or b"").decode().strip()
-        log.info("git pull: %s", pull_result)
-    except Exception as e:
-        log.error("git pull failed: %s", e)
-        pull_result = f"pull failed: {e}"
+        url = "https://api.github.com/repos/arenazl/slsk-agent/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "GrooveSyncAgent"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        latest = data.get("tag_name", "").lstrip("v")
+        current = VERSION
 
-    # Re-launch self
-    exe = sys.executable
-    script = str(Path(__file__).resolve())
+        if latest > current:
+            log.info("Update available: v%s -> v%s", current, latest)
 
-    if getattr(sys, 'frozen', False) or exe.endswith('.exe'):
-        # Frozen exe: use a bat to wait, then relaunch
-        bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_restart.bat"
-        bat.write_text(f"""@echo off
+            if sys.platform == "darwin":
+                import zipfile
+                zip_url = None
+                for asset in data.get("assets", []):
+                    if asset["name"].endswith("-macOS.zip"):
+                        zip_url = asset["browser_download_url"]
+                        break
+                if zip_url:
+                    tmp_zip = Path("/tmp") / "GrooveSyncAgent-macOS.zip"
+                    tmp_extract = Path("/tmp") / "GrooveSyncAgent_update"
+                    urllib.request.urlretrieve(zip_url, str(tmp_zip))
+                    if tmp_extract.exists():
+                        shutil.rmtree(tmp_extract)
+                    with zipfile.ZipFile(str(tmp_zip), 'r') as zf:
+                        zf.extractall(str(tmp_extract))
+                    tmp_zip.unlink(missing_ok=True)
+
+                    if getattr(sys, 'frozen', False):
+                        current_app = Path(sys.executable).resolve().parent.parent.parent
+                        new_app = tmp_extract / "GrooveSyncAgent.app"
+                        if new_app.exists() and current_app.name.endswith(".app"):
+                            update_sh = Path("/tmp") / "groovesync_update.sh"
+                            update_sh.write_text(f"""#!/bin/bash
+sleep 2
+rm -rf "{current_app}"
+cp -R "{new_app}" "{current_app}"
+open "{current_app}"
+rm -rf "{tmp_extract}"
+rm -f "$0"
+""", encoding="utf-8")
+                            update_sh.chmod(0o755)
+                            update_msg = f"Actualizando a v{latest}..."
+                            subprocess.Popen(["/bin/bash", str(update_sh)])
+                        else:
+                            update_msg = f"v{latest} disponible pero no se pudo actualizar .app"
+                    else:
+                        update_msg = f"v{latest} disponible (solo .app compilado)"
+                        shutil.rmtree(tmp_extract, ignore_errors=True)
+                else:
+                    update_msg = "No se encontró build macOS en el release"
+            else:
+                # Windows
+                exe_url = None
+                for asset in data.get("assets", []):
+                    if asset["name"].endswith(".exe"):
+                        exe_url = asset["browser_download_url"]
+                        break
+                if exe_url:
+                    tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "GrooveSyncAgent_update.exe"
+                    log.info("Downloading update from %s", exe_url)
+                    urllib.request.urlretrieve(exe_url, str(tmp_path))
+
+                    current_exe = Path(sys.executable)
+                    if getattr(sys, 'frozen', False) or sys.executable.endswith('.exe'):
+                        bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
+                        bat.write_text(f"""@echo off
+timeout /t 2 /nobreak >nul
+copy /Y "{tmp_path}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+""", encoding="utf-8")
+                        update_msg = f"Actualizando a v{latest}..."
+                        log.info("Launching update+restart bat...")
+                        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
+                    else:
+                        update_msg = f"v{latest} disponible (solo .exe compilado)"
+                else:
+                    update_msg = "No se encontró .exe en el release"
+        else:
+            # Already up to date — just restart the process
+            update_msg = f"Ya en v{current}, reiniciando..."
+            log.info("No update needed, restarting current version...")
+
+            exe = sys.executable
+            if getattr(sys, 'frozen', False) or exe.endswith('.exe'):
+                bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_restart.bat"
+                bat.write_text(f"""@echo off
 timeout /t 2 /nobreak >nul
 start "" "{exe}"
 del "%~f0"
 """, encoding="utf-8")
-        log.info("Restarting agent via bat...")
-        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
-    else:
-        # Running as python script: respawn
-        log.info("Restarting agent via python...")
-        subprocess.Popen([exe, script])
+                subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
+            elif sys.platform == "darwin":
+                if getattr(sys, 'frozen', False):
+                    current_app = Path(sys.executable).resolve().parent.parent.parent
+                    subprocess.Popen(["open", str(current_app)])
+                else:
+                    subprocess.Popen([exe, str(Path(__file__).resolve())])
+            else:
+                subprocess.Popen([exe, str(Path(__file__).resolve())])
+
+    except Exception as e:
+        log.exception("Restart/update failed")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
 
     # Send response before exiting
-    resp = web.json_response({"ok": True, "pull": pull_result, "restarting": True})
+    resp = web.json_response({"ok": True, "message": update_msg, "restarting": True})
     await resp.prepare(request)
     await resp.write_eof()
 
-    # Give time for response to flush, then exit
     await asyncio.sleep(0.5)
     os._exit(0)
 
