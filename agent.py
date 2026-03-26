@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -825,7 +825,8 @@ async def handle_track_analysis(request: web.Request):
         return web.json_response({"error": "ffmpeg/ffprobe not found"}, status=500)
 
     def analyze(filepath):
-        import numpy as np
+        import struct
+        import math
 
         # Get duration first
         probe = subprocess.run(
@@ -844,34 +845,39 @@ async def handle_track_analysis(request: web.Request):
              "-f", "s16le", "-v", "quiet", "-"],
             capture_output=True, timeout=120,
         )
-        samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32)
-        if len(samples) < 22050:
+        raw = result.stdout
+        n_samples = len(raw) // 2
+        if n_samples < 22050:
             return {"intro_end": 0, "outro_start": duration, "duration": duration}
+
+        samples = struct.unpack(f"<{n_samples}h", raw)
 
         sr = 22050
         # Compute RMS energy in 1-second windows
-        window = sr  # 1 second
-        hop = sr     # non-overlapping
-        n_frames = len(samples) // hop
-        rms = np.zeros(n_frames)
+        n_frames = n_samples // sr
+        rms = []
         for i in range(n_frames):
-            chunk = samples[i * hop:(i + 1) * hop]
-            rms[i] = np.sqrt(np.mean(chunk ** 2))
+            start = i * sr
+            end = start + sr
+            chunk = samples[start:end]
+            mean_sq = sum(s * s for s in chunk) / len(chunk)
+            rms.append(math.sqrt(mean_sq))
 
         if len(rms) < 10:
             return {"intro_end": 0, "outro_start": duration, "duration": duration}
 
         # Smooth RMS with a 4-second moving average
         kernel = 4
-        if len(rms) > kernel:
-            smoothed = np.convolve(rms, np.ones(kernel) / kernel, mode='same')
-        else:
-            smoothed = rms
+        smoothed = []
+        for i in range(len(rms)):
+            lo = max(0, i - kernel // 2)
+            hi = min(len(rms), i + kernel // 2 + 1)
+            smoothed.append(sum(rms[lo:hi]) / (hi - lo))
 
         # Normalize
-        peak = np.max(smoothed)
+        peak = max(smoothed) if smoothed else 1.0
         if peak > 0:
-            smoothed = smoothed / peak
+            smoothed = [v / peak for v in smoothed]
 
         # Threshold: "full energy" is above 60% of peak
         threshold = 0.60
@@ -883,7 +889,7 @@ async def handle_track_analysis(request: web.Request):
             if smoothed[i] >= threshold:
                 consecutive += 1
                 if consecutive >= 4:
-                    intro_end = max(0, i - 3)  # start of the sustained section
+                    intro_end = max(0, i - 3)
                     break
             else:
                 consecutive = 0
@@ -905,7 +911,7 @@ async def handle_track_analysis(request: web.Request):
         outro_start = max(outro_start, duration * 0.60)
 
         # Round to nearest beat-grid (assuming ~128 BPM = 0.46875s per beat, 4 beats = 1.875s)
-        beat_bar = 1.875  # 4 beats at 128bpm
+        beat_bar = 1.875
         intro_end = round(intro_end / beat_bar) * beat_bar
         outro_start = round(outro_start / beat_bar) * beat_bar
 
