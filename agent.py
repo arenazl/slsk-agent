@@ -791,6 +791,131 @@ async def handle_track_info(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+async def handle_track_analysis(request: web.Request):
+    """Analyze a track's energy envelope to detect intro/outro boundaries.
+
+    Returns intro_end (seconds from start where intro ends / beat kicks in)
+    and outro_start (seconds from start where outro begins / energy drops).
+    Uses ffmpeg to decode audio and numpy for RMS energy analysis.
+    """
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"error": "No folder configured"}, status=400)
+
+    rel = request.match_info.get("path", "")
+    if not rel:
+        return web.json_response({"error": "Missing file path"}, status=400)
+
+    target = Path(folder) / rel
+    if not target.exists() or not target.is_file():
+        target = _find_file_in_library(Path(rel).name)
+        if not target or not target.exists():
+            return web.json_response({"error": "File not found"}, status=404)
+
+    ffprobe = shutil.which("ffprobe")
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg_bin:
+        return web.json_response({"error": "ffmpeg/ffprobe not found"}, status=500)
+
+    def analyze(filepath):
+        import numpy as np
+
+        # Get duration first
+        probe = subprocess.run(
+            [ffprobe, "-v", "quiet", "-print_format", "json",
+             "-show_format", str(filepath)],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(probe.stdout)
+        duration = float(info.get("format", {}).get("duration", 0))
+        if duration < 30:
+            return {"intro_end": 0, "outro_start": duration, "duration": duration}
+
+        # Decode to raw PCM mono 22050Hz using ffmpeg
+        result = subprocess.run(
+            [ffmpeg_bin, "-i", str(filepath), "-ac", "1", "-ar", "22050",
+             "-f", "s16le", "-v", "quiet", "-"],
+            capture_output=True, timeout=120,
+        )
+        samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32)
+        if len(samples) < 22050:
+            return {"intro_end": 0, "outro_start": duration, "duration": duration}
+
+        sr = 22050
+        # Compute RMS energy in 1-second windows
+        window = sr  # 1 second
+        hop = sr     # non-overlapping
+        n_frames = len(samples) // hop
+        rms = np.zeros(n_frames)
+        for i in range(n_frames):
+            chunk = samples[i * hop:(i + 1) * hop]
+            rms[i] = np.sqrt(np.mean(chunk ** 2))
+
+        if len(rms) < 10:
+            return {"intro_end": 0, "outro_start": duration, "duration": duration}
+
+        # Smooth RMS with a 4-second moving average
+        kernel = 4
+        if len(rms) > kernel:
+            smoothed = np.convolve(rms, np.ones(kernel) / kernel, mode='same')
+        else:
+            smoothed = rms
+
+        # Normalize
+        peak = np.max(smoothed)
+        if peak > 0:
+            smoothed = smoothed / peak
+
+        # Threshold: "full energy" is above 60% of peak
+        threshold = 0.60
+
+        # Find intro_end: first moment energy stays above threshold for 4+ seconds
+        intro_end = 0
+        consecutive = 0
+        for i in range(len(smoothed)):
+            if smoothed[i] >= threshold:
+                consecutive += 1
+                if consecutive >= 4:
+                    intro_end = max(0, i - 3)  # start of the sustained section
+                    break
+            else:
+                consecutive = 0
+
+        # Find outro_start: last moment energy drops below threshold for 4+ seconds
+        outro_start = duration
+        consecutive = 0
+        for i in range(len(smoothed) - 1, -1, -1):
+            if smoothed[i] >= threshold:
+                consecutive += 1
+                if consecutive >= 4:
+                    outro_start = min(duration, i + 4)
+                    break
+            else:
+                consecutive = 0
+
+        # Clamp: intro should be max 25% of track, outro start min 60% of track
+        intro_end = min(intro_end, duration * 0.25)
+        outro_start = max(outro_start, duration * 0.60)
+
+        # Round to nearest beat-grid (assuming ~128 BPM = 0.46875s per beat, 4 beats = 1.875s)
+        beat_bar = 1.875  # 4 beats at 128bpm
+        intro_end = round(intro_end / beat_bar) * beat_bar
+        outro_start = round(outro_start / beat_bar) * beat_bar
+
+        return {
+            "intro_end": round(max(0, intro_end), 2),
+            "outro_start": round(min(duration, outro_start), 2),
+            "duration": round(duration, 2),
+        }
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, analyze, target)
+        return web.json_response(result)
+    except Exception as e:
+        log.exception("track-analysis failed for %s", target)
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def handle_mix_export(request: web.Request):
     """Render a DJ mix using FFmpeg filter_complex (adelay + afade + amix)."""
     folder = get_download_folder()
@@ -1003,6 +1128,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/export", handle_export)
     app.router.add_post("/api/export-set", handle_export_set)
     app.router.add_get("/api/track-info/{path:.+}", handle_track_info)
+    app.router.add_get("/api/track-analysis/{path:.+}", handle_track_analysis)
     app.router.add_post("/api/mix-export", handle_mix_export)
     app.router.add_post("/api/refresh-charts", handle_refresh_charts)
     return app
