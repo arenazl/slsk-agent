@@ -1092,6 +1092,59 @@ async def handle_refresh_charts(request: web.Request):
 
 
 # ---------------------------------------------------------------------------
+# Self-restart endpoint
+# ---------------------------------------------------------------------------
+
+async def handle_restart(request: web.Request):
+    """Restart the agent process (git pull + re-launch)."""
+    folder = Path(__file__).resolve().parent
+
+    # Git pull latest code
+    pull_result = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull", "--ff-only",
+            cwd=str(folder),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        pull_result = (stdout or b"").decode().strip()
+        log.info("git pull: %s", pull_result)
+    except Exception as e:
+        log.error("git pull failed: %s", e)
+        pull_result = f"pull failed: {e}"
+
+    # Re-launch self
+    exe = sys.executable
+    script = str(Path(__file__).resolve())
+
+    if getattr(sys, 'frozen', False) or exe.endswith('.exe'):
+        # Frozen exe: use a bat to wait, then relaunch
+        bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_restart.bat"
+        bat.write_text(f"""@echo off
+timeout /t 2 /nobreak >nul
+start "" "{exe}"
+del "%~f0"
+""", encoding="utf-8")
+        log.info("Restarting agent via bat...")
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
+    else:
+        # Running as python script: respawn
+        log.info("Restarting agent via python...")
+        subprocess.Popen([exe, script])
+
+    # Send response before exiting
+    resp = web.json_response({"ok": True, "pull": pull_result, "restarting": True})
+    await resp.prepare(request)
+    await resp.write_eof()
+
+    # Give time for response to flush, then exit
+    await asyncio.sleep(0.5)
+    os._exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Catch-all for OPTIONS preflight requests
 # ---------------------------------------------------------------------------
 
@@ -1139,6 +1192,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/track-analysis/{path:.+}", handle_track_analysis)
     app.router.add_post("/api/mix-export", handle_mix_export)
     app.router.add_post("/api/refresh-charts", handle_refresh_charts)
+    app.router.add_post("/api/restart", handle_restart)
     return app
 
 
