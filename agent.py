@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.6.2"
+VERSION = "2.6.3"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -139,6 +139,127 @@ def remove_from_manifest(filename: str):
 # ---------------------------------------------------------------------------
 
 
+def _analyze_and_store(filepath: Path, filename: str):
+    """Analyze a track (duration, BPM proxy, intro/outro) and store in manifest.
+
+    Runs synchronously — intended for use in a thread executor.
+    """
+    import struct
+    import math
+
+    ffprobe = shutil.which("ffprobe")
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg_bin:
+        log.warning("ffprobe/ffmpeg not found, skipping analysis for %s", filename)
+        return
+
+    meta = {}
+
+    # --- Duration + sample rate ---
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", str(filepath)],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(result.stdout)
+        duration = float(info.get("format", {}).get("duration", 0))
+        meta["duration"] = round(duration, 2)
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                meta["sample_rate"] = int(stream.get("sample_rate", 44100))
+                break
+    except Exception as e:
+        log.warning("ffprobe failed for %s: %s", filename, e)
+        return
+
+    if meta.get("duration", 0) < 10:
+        upsert_manifest(filename, meta)
+        return
+
+    # --- Decode to PCM for energy analysis ---
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-i", str(filepath), "-ac", "1", "-ar", "22050",
+             "-f", "s16le", "-v", "quiet", "-"],
+            capture_output=True, timeout=120,
+        )
+        raw = result.stdout
+        n_samples = len(raw) // 2
+        if n_samples < 22050:
+            upsert_manifest(filename, meta)
+            return
+
+        samples = struct.unpack(f"<{n_samples}h", raw)
+        sr = 22050
+        duration = meta["duration"]
+
+        # --- RMS energy in 1-second windows ---
+        n_frames = n_samples // sr
+        rms = []
+        for i in range(n_frames):
+            start = i * sr
+            chunk = samples[start:start + sr]
+            mean_sq = sum(s * s for s in chunk) / len(chunk)
+            rms.append(math.sqrt(mean_sq))
+
+        if len(rms) >= 10:
+            # Smooth with 4s moving average
+            smoothed = []
+            for i in range(len(rms)):
+                lo = max(0, i - 2)
+                hi = min(len(rms), i + 3)
+                smoothed.append(sum(rms[lo:hi]) / (hi - lo))
+
+            peak = max(smoothed) if smoothed else 1.0
+            if peak > 0:
+                smoothed = [v / peak for v in smoothed]
+
+            threshold = 0.60
+
+            # Intro end
+            intro_end = 0
+            consec = 0
+            for i in range(len(smoothed)):
+                if smoothed[i] >= threshold:
+                    consec += 1
+                    if consec >= 4:
+                        intro_end = max(0, i - 3)
+                        break
+                else:
+                    consec = 0
+
+            # Outro start
+            outro_start = duration
+            consec = 0
+            for i in range(len(smoothed) - 1, -1, -1):
+                if smoothed[i] >= threshold:
+                    consec += 1
+                    if consec >= 4:
+                        outro_start = min(duration, i + 4)
+                        break
+                else:
+                    consec = 0
+
+            # Clamp
+            intro_end = min(intro_end, duration * 0.25)
+            outro_start = max(outro_start, duration * 0.60)
+
+            # Snap to beat grid (4 beats at 128 BPM)
+            beat_bar = 1.875
+            intro_end = round(intro_end / beat_bar) * beat_bar
+            outro_start = round(outro_start / beat_bar) * beat_bar
+
+            meta["intro_end"] = round(max(0, intro_end), 2)
+            meta["outro_start"] = round(min(duration, outro_start), 2)
+
+    except Exception as e:
+        log.warning("Energy analysis failed for %s: %s", filename, e)
+
+    upsert_manifest(filename, meta)
+    log.info("Analyzed and stored metadata for %s: %s", filename, meta)
+
+
 def _find_file_in_library(filename: str) -> Path | None:
     """Find a file anywhere inside the download folder tree."""
     folder = get_download_folder()
@@ -250,6 +371,10 @@ async def handle_save_file(request: web.Request):
     dest_path = dest_dir / filename
     dest_path.write_bytes(file_data)
     log.info("Saved file: %s", dest_path)
+
+    # Analyze in background (duration, intro/outro, etc.) and store in manifest
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _analyze_and_store, dest_path, filename)
 
     return web.json_response({"ok": True, "path": str(dest_path)})
 
@@ -741,12 +866,25 @@ async def handle_export_set(request: web.Request):
 
 
 async def handle_track_info(request: web.Request):
-    """Return duration, sample_rate, format for a track using ffprobe."""
+    """Return duration, sample_rate, format for a track. Checks manifest first."""
     folder = get_download_folder()
     if not folder:
         return web.json_response({"error": "No folder configured"}, status=400)
 
     rel = request.match_info.get("path", "")
+    # Check manifest for pre-analyzed data
+    fname = Path(rel).name
+    manifest = load_manifest()
+    entry = manifest.get(fname, {})
+    if entry.get("duration"):
+        return web.json_response({
+            "duration_seconds": entry["duration"],
+            "sample_rate": entry.get("sample_rate", 44100),
+            "format": Path(rel).suffix.lstrip(".").upper(),
+            "bpm": entry.get("bpm"),
+            "intro_end": entry.get("intro_end"),
+            "outro_start": entry.get("outro_start"),
+        })
     if not rel:
         return web.json_response({"error": "Missing file path"}, status=400)
 
@@ -809,7 +947,18 @@ async def handle_track_analysis(request: web.Request):
     if not rel:
         return web.json_response({"error": "Missing file path"}, status=400)
 
-    # Check cache first
+    # Check manifest first (pre-analyzed on download)
+    fname = Path(rel).name
+    manifest = load_manifest()
+    entry = manifest.get(fname, {})
+    if entry.get("intro_end") is not None and entry.get("outro_start") is not None:
+        return web.json_response({
+            "intro_end": entry["intro_end"],
+            "outro_start": entry["outro_start"],
+            "duration": entry.get("duration", 0),
+        })
+
+    # Check in-memory cache
     if rel in _analysis_cache:
         return web.json_response(_analysis_cache[rel])
 
@@ -924,6 +1073,8 @@ async def handle_track_analysis(request: web.Request):
     try:
         result = await asyncio.get_event_loop().run_in_executor(None, analyze, target)
         _analysis_cache[rel] = result
+        # Also persist to manifest so we never re-analyze
+        upsert_manifest(fname, result)
         return web.json_response(result)
     except Exception as e:
         log.exception("track-analysis failed for %s", target)
