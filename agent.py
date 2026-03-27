@@ -33,6 +33,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5174",
     "http://localhost:5175",
 ]
+SERVER_URL = "https://slsk-backend-7da97b8a965d.herokuapp.com"
 AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".wav", ".aif", ".aiff",
     ".m4a", ".ogg", ".aac", ".wma", ".opus",
@@ -467,6 +468,7 @@ async def handle_config(request: web.Request):
         config["username"] = username
         save_config(config)
         log.info("Username linked: %s", username)
+        asyncio.ensure_future(_register_agent_ip())
 
     if "primary" in body:
         config = load_config()
@@ -1436,14 +1438,77 @@ def create_app() -> web.Application:
     return app
 
 
+def _get_local_ip():
+    """Get the local network IP address of this machine."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
+def _get_tailscale_funnel_url():
+    """Detect Tailscale Funnel HTTPS URL if active."""
+    import subprocess
+    try:
+        out = subprocess.check_output(["tailscale", "funnel", "status"], text=True, timeout=5)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("https://") and line.endswith("/"):
+                return line.rstrip("/")
+    except Exception:
+        pass
+    return None
+
+
+async def _register_agent_ip():
+    """Register this agent's public URL with the cloud server so mobile/remote clients can connect."""
+    config = load_config()
+    username = config.get("username")
+    if not username:
+        log.info("No username configured, skipping agent registration")
+        return
+    # Prefer Tailscale Funnel (HTTPS, works from internet)
+    agent_host = _get_tailscale_funnel_url()
+    if not agent_host:
+        local_ip = _get_local_ip()
+        if not local_ip:
+            log.warning("Could not determine agent host")
+            return
+        agent_host = f"http://{local_ip}:{PORT}"
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            await session.post(f"{SERVER_URL}/api/agent/register", json={
+                "username": username,
+                "agent_host": agent_host,
+            })
+        log.info("Registered agent host %s for user %s", agent_host, username)
+    except Exception as e:
+        log.warning("Failed to register agent: %s", e)
+
+
 async def start_server():
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", PORT)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("HTTP server running on http://127.0.0.1:%d", PORT)
+    log.info("HTTP server running on http://0.0.0.0:%d", PORT)
+    # Register agent IP with cloud server periodically so mobile clients can find us
+    asyncio.ensure_future(_register_agent_loop())
     return runner
+
+
+async def _register_agent_loop():
+    """Register agent IP on startup and every 4 minutes (server TTL is 5 min)."""
+    while True:
+        await _register_agent_ip()
+        await asyncio.sleep(240)
 
 
 # ---------------------------------------------------------------------------
