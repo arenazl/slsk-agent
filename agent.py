@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.7.1"
+VERSION = "2.7.2"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -1455,7 +1455,10 @@ def _get_tailscale_funnel_url():
     """Detect Tailscale Funnel HTTPS URL if active."""
     import subprocess
     try:
-        out = subprocess.check_output(["tailscale", "funnel", "status"], text=True, timeout=5)
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        out = subprocess.check_output(["tailscale", "funnel", "status"], text=True, timeout=5, startupinfo=si)
         for line in out.splitlines():
             line = line.strip()
             if line.startswith("https://") and ".ts.net" in line:
