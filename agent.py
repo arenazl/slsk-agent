@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.7.3"
+VERSION = "2.7.4"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -1343,8 +1343,9 @@ rm -f "$0"
                     log.info("Downloading update from %s", exe_url)
                     urllib.request.urlretrieve(exe_url, str(tmp_path))
 
-                    current_exe = Path(sys.executable)
-                    if getattr(sys, 'frozen', False) or sys.executable.endswith('.exe'):
+                    # In onefile mode, sys.executable points to temp python.exe — use the real exe path
+                    current_exe = Path(sys.executable) if not hasattr(sys, '_MEIPASS') else Path(sys.argv[0]).resolve()
+                    if getattr(sys, 'frozen', False) or str(current_exe).endswith('.exe'):
                         bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
                         bat.write_text(f"""@echo off
 timeout /t 2 /nobreak >nul
@@ -1364,8 +1365,8 @@ del "%~f0"
             update_msg = f"Ya en v{current}, reiniciando..."
             log.info("No update needed, restarting current version...")
 
-            exe = sys.executable
-            if getattr(sys, 'frozen', False) or exe.endswith('.exe'):
+            exe = Path(sys.argv[0]).resolve() if hasattr(sys, '_MEIPASS') else Path(sys.executable)
+            if getattr(sys, 'frozen', False) or str(exe).endswith('.exe'):
                 bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_restart.bat"
                 bat.write_text(f"""@echo off
 timeout /t 2 /nobreak >nul
