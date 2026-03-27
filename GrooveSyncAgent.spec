@@ -52,6 +52,6 @@ app = BUNDLE(
     bundle_identifier='com.groovesync.agent',
     info_plist={
         'LSUIElement': True,
-        'CFBundleShortVersionString': '2.6.3',
+        'CFBundleShortVersionString': '2.7.0',
     },
 )
