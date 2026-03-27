@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.7.2"
+VERSION = "2.7.3"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -656,15 +656,18 @@ async def handle_audio(request: web.Request):
             },
         )
         await resp.prepare(request)
-        with open(target, "rb") as f:
-            f.seek(start)
-            remaining = length
-            while remaining > 0:
-                chunk = f.read(min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                await resp.write(chunk)
-                remaining -= len(chunk)
+        try:
+            with open(target, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    await resp.write(chunk)
+                    remaining -= len(chunk)
+        except (ConnectionResetError, ConnectionAbortedError, OSError):
+            return resp
     else:
         resp = web.StreamResponse(
             status=200,
@@ -676,11 +679,17 @@ async def handle_audio(request: web.Request):
             },
         )
         await resp.prepare(request)
-        with open(target, "rb") as f:
-            while chunk := f.read(64 * 1024):
-                await resp.write(chunk)
+        try:
+            with open(target, "rb") as f:
+                while chunk := f.read(64 * 1024):
+                    await resp.write(chunk)
+        except (ConnectionResetError, ConnectionAbortedError, OSError):
+            return resp
 
-    await resp.write_eof()
+    try:
+        await resp.write_eof()
+    except (ConnectionResetError, ConnectionAbortedError, OSError):
+        pass
     return resp
 
 
