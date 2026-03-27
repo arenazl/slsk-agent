@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -1458,8 +1458,10 @@ def _get_tailscale_funnel_url():
         out = subprocess.check_output(["tailscale", "funnel", "status"], text=True, timeout=5)
         for line in out.splitlines():
             line = line.strip()
-            if line.startswith("https://") and line.endswith("/"):
-                return line.rstrip("/")
+            if line.startswith("https://") and ".ts.net" in line:
+                # Line like: "https://lookpcnew.tail4ac337.ts.net (Funnel on)"
+                url = line.split()[0].rstrip("/")
+                return url
     except Exception:
         pass
     return None
