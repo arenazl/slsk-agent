@@ -19,8 +19,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='GrooveSyncAgent',
     debug=False,
     bootloader_ignore_signals=False,
@@ -36,22 +37,13 @@ exe = EXE(
     entitlements_file=None,
     icon=['logo.png'],
 )
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='GrooveSyncAgent',
-)
 app = BUNDLE(
-    coll,
+    exe,
     name='GrooveSyncAgent.app',
     icon='logo.png',
     bundle_identifier='com.groovesync.agent',
     info_plist={
         'LSUIElement': True,
-        'CFBundleShortVersionString': '2.7.0',
+        'CFBundleShortVersionString': '2.7.5',
     },
 )

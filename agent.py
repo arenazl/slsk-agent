@@ -24,7 +24,7 @@ from aiohttp import web
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.7.4"
+VERSION = "2.7.5"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -57,6 +57,49 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("groovesync")
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers (hide cmd windows on Windows)
+# ---------------------------------------------------------------------------
+
+
+def _hidden_startupinfo():
+    """Return a STARTUPINFO that hides the console window on Windows."""
+    if sys.platform != "win32":
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return si
+
+
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+# Monkey-patch subprocess.run and Popen to always hide windows on Windows
+_original_run = subprocess.run
+_original_popen_init = subprocess.Popen.__init__
+
+
+def _patched_run(*args, **kwargs):
+    if sys.platform == "win32" and "startupinfo" not in kwargs:
+        kwargs["startupinfo"] = _hidden_startupinfo()
+    if sys.platform == "win32" and "creationflags" not in kwargs:
+        kwargs["creationflags"] = _NO_WINDOW
+    return _original_run(*args, **kwargs)
+
+
+def _patched_popen_init(self, *args, **kwargs):
+    if sys.platform == "win32" and "startupinfo" not in kwargs:
+        kwargs["startupinfo"] = _hidden_startupinfo()
+    if sys.platform == "win32" and "creationflags" not in kwargs:
+        kwargs["creationflags"] = _NO_WINDOW
+    _original_popen_init(self, *args, **kwargs)
+
+
+subprocess.run = _patched_run
+subprocess.Popen.__init__ = _patched_popen_init
+
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -1910,18 +1953,22 @@ def run_tray(ready_event: threading.Event):
 
 
 def first_run_setup():
-    """Prompt user to pick a download folder on first run."""
-    if get_download_folder():
+    """Prompt user to pick a download folder on first run or if configured folder no longer exists."""
+    current = get_download_folder()
+    if current and Path(current).exists():
         return
 
-    log.info("First run detected — prompting for download folder")
+    if current:
+        log.warning("Configured folder %s no longer exists — re-prompting", current)
+    else:
+        log.info("First run detected — prompting for download folder")
     folder = _pick_folder()
     if folder:
         set_download_folder(folder)
-        log.info("Initial folder set to: %s", folder)
+        log.info("Folder set to: %s", folder)
     else:
-        # Set a sensible default
         default = str(Path.home() / "Music" / "GrooveSync")
+        Path(default).mkdir(parents=True, exist_ok=True)
         set_download_folder(default)
         log.info("No folder selected, using default: %s", default)
 
