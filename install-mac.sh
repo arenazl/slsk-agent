@@ -32,7 +32,7 @@ source ~/.groovesync/venv/bin/activate
 # Install dependencies
 echo "Instalando dependencias..."
 pip install --upgrade pip 2>/dev/null
-pip install pystray pillow aiohttp cloudinary 2>/dev/null
+pip install pystray pillow aiohttp cloudinary aioslsk 2>/dev/null
 
 # Install FFmpeg via Homebrew if available
 if command -v brew &> /dev/null; then
@@ -65,7 +65,7 @@ cat > ~/.groovesync/update.command << 'UPDATER'
 #!/bin/bash
 echo "Actualizando GrooveSync Agent..."
 source ~/.groovesync/venv/bin/activate
-pip install --upgrade pystray pillow aiohttp cloudinary 2>/dev/null
+pip install --upgrade pystray pillow aiohttp cloudinary aioslsk 2>/dev/null
 curl -sL https://raw.githubusercontent.com/arenazl/slsk-agent/master/agent.py -o ~/.groovesync/agent.py
 echo "Actualizado. Reinicia el agente."
 UPDATER

@@ -20,6 +20,15 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 from aiohttp import web
 
+# SoulSeek client (optional — agente funciona sin él, pero sin esto los
+# downloads delegados no funcionan. `pip install aioslsk` para activarlo).
+try:
+    from aioslsk.client import SoulSeekClient
+    from aioslsk.settings import Settings, CredentialsSettings, SharesSettings
+    AIOSLSK_AVAILABLE = True
+except ImportError:
+    AIOSLSK_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -357,6 +366,182 @@ async def cors_middleware(request: web.Request, handler):
 
 
 # ---------------------------------------------------------------------------
+# SoulSeek client (persistent connection, reused across downloads)
+# ---------------------------------------------------------------------------
+
+_slsk_client = None
+_slsk_lock = asyncio.Lock()
+_slsk_credentials = None  # (username, password) currently logged in
+
+async def get_slsk_client(username: str, password: str):
+    """Return a live SoulSeek client, reusing the existing login when possible.
+    Connection is kept alive across calls — login is expensive and peer-reputation
+    improves with long-lived connections (Nicotine+ pattern)."""
+    global _slsk_client, _slsk_credentials
+    if not AIOSLSK_AVAILABLE:
+        raise RuntimeError("aioslsk not installed. Run: pip install aioslsk")
+    async with _slsk_lock:
+        if _slsk_client is not None and _slsk_credentials == (username, password):
+            return _slsk_client
+        # Creds changed or no client yet — (re)connect
+        if _slsk_client is not None:
+            try:
+                await _slsk_client.stop()
+            except Exception:
+                pass
+            _slsk_client = None
+        folder = get_download_folder() or str(Path.home() / "Downloads")
+        settings = Settings(
+            credentials=CredentialsSettings(username=username, password=password),
+            shares=SharesSettings(download=folder),
+            network={
+                "listening": {"port": 64321, "port_range": 100},
+                "listening_obfuscated": {"port": 64421, "port_range": 100},
+            },
+        )
+        client = SoulSeekClient(settings)
+        await client.start()
+        await client.login()
+        _slsk_client = client
+        _slsk_credentials = (username, password)
+        log.info("SoulSeek client connected as %s", username)
+        return _slsk_client
+
+
+async def _report_progress(callback_url: str, payload: dict):
+    """POST progress to Heroku so it broadcasts to UI via WS."""
+    if not callback_url:
+        return
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            await s.post(callback_url, json=payload,
+                         timeout=aiohttp.ClientTimeout(total=5))
+    except Exception as e:
+        log.debug("progress callback failed: %s", e)
+
+
+async def _run_slsk_download(username, password, sources, filename, callback_url):
+    """Background task: try each source with fail-fast; report progress."""
+    async def report(status, **kw):
+        await _report_progress(callback_url, {"filename": filename, "status": status, **kw})
+
+    folder = get_download_folder()
+    if not folder:
+        await report("error", message="No download folder configured")
+        return
+
+    try:
+        client = await get_slsk_client(username, password)
+    except Exception as e:
+        await report("error", message=f"connect: {str(e)[:120]}")
+        return
+
+    tried_users = set()
+    for src_idx, src in enumerate(sources):
+        peer = src.get("username") or src.get("peer")
+        remote_path = src.get("remote_path")
+        if not peer or not remote_path or peer in tried_users:
+            continue
+        tried_users.add(peer)
+        queue = src.get("queue", 0) or 0
+        has_slots = bool(src.get("free_slots"))
+        is_last = (src_idx >= len(sources) - 1)
+
+        await report("queued", source=peer, queue=queue,
+                     source_idx=src_idx + 1, source_total=len(sources))
+
+        try:
+            transfer = await client.transfers.download(peer, remote_path)
+        except Exception as e:
+            log.debug("download init failed for %s: %s", peer, e)
+            await report("error_source", source=peer, message=str(e)[:100])
+            continue
+
+        last_bytes = 0
+        stall_count = 0
+        # Slot peers: 10s ghost check. Active peers: 60s. Hopeless: 180s (last).
+        if has_slots and queue < 50:
+            MAX_STALL = 15
+        elif is_last:
+            MAX_STALL = 180
+        elif queue > 500:
+            MAX_STALL = 60
+        else:
+            MAX_STALL = 30
+        transfer_started = False
+        last_status_sec = 0
+
+        for elapsed in range(7200):  # max 2h safety
+            await asyncio.sleep(1)
+            try:
+                if transfer.is_finalized():
+                    break
+            except Exception:
+                pass
+            current = getattr(transfer, "bytes_transfered", 0) or 0
+            if current > last_bytes:
+                if not transfer_started:
+                    transfer_started = True
+                    MAX_STALL = max(MAX_STALL, 120)  # be patient once serving
+                last_bytes = current
+                stall_count = 0
+                if transfer.filesize:
+                    pct = int(current / transfer.filesize * 100)
+                    speed_kb = int((getattr(transfer, "speed", 0) or 0) / 1024)
+                    await report("downloading", pct=pct, speed=speed_kb, source=peer)
+            else:
+                stall_count += 1
+                if stall_count - last_status_sec >= 15:
+                    last_status_sec = stall_count
+                    await report("queued", source=peer, queue=queue,
+                                 wait_secs=stall_count, timeout_secs=MAX_STALL,
+                                 source_idx=src_idx + 1, source_total=len(sources))
+                if stall_count >= MAX_STALL:
+                    break
+
+        try:
+            finalized_ok = transfer.is_finalized() and transfer.is_transfered()
+        except Exception:
+            finalized_ok = False
+        if finalized_ok:
+            await report("completed", source=peer)
+            return
+
+    await report("error", message="no sources succeeded")
+
+
+async def handle_slsk_download(request: web.Request):
+    """Delegated download entry point. Body: {username, password, filename,
+    sources:[{username,remote_path,queue,free_slots,speed}], callback_url}.
+    Returns immediately; progress streams to callback_url on Heroku."""
+    if not AIOSLSK_AVAILABLE:
+        return web.json_response(
+            {"ok": False, "error": "aioslsk not installed on agent"},
+            status=501,
+        )
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    username = data.get("username")
+    password = data.get("password")
+    sources = data.get("sources") or []
+    filename = data.get("filename")
+    callback_url = data.get("callback_url") or ""
+
+    if not username or not password or not filename or not sources:
+        return web.json_response(
+            {"ok": False, "error": "Missing username/password/filename/sources"},
+            status=400,
+        )
+
+    asyncio.create_task(_run_slsk_download(username, password, sources, filename, callback_url))
+    return web.json_response({"ok": True, "status": "started", "source_count": len(sources)})
+
+
+# ---------------------------------------------------------------------------
 # HTTP Handlers
 # ---------------------------------------------------------------------------
 
@@ -369,6 +554,7 @@ async def handle_status(request: web.Request):
         "folder": folder,
         "version": VERSION,
         "ffmpeg": ffmpeg_available,
+        "slsk": AIOSLSK_AVAILABLE,
     })
 
 
@@ -1488,6 +1674,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/mix-export", handle_mix_export)
     app.router.add_post("/api/refresh-charts", handle_refresh_charts)
     app.router.add_post("/api/restart", handle_restart)
+    app.router.add_post("/api/slsk-download", handle_slsk_download)
     return app
 
 
