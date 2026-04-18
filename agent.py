@@ -424,7 +424,9 @@ async def _report_progress(callback_url: str, payload: dict):
 async def _run_slsk_download(username, password, sources, filename, callback_url):
     """Background task: try each source with fail-fast; report progress."""
     async def report(status, **kw):
-        await _report_progress(callback_url, {"filename": filename, "status": status, **kw})
+        # via="agent" — la UI se entera que el archivo ya está en disco local
+        # y no intenta hacer fetch a Heroku /audio (que daría 404).
+        await _report_progress(callback_url, {"filename": filename, "status": status, "via": "agent", **kw})
 
     folder = get_download_folder()
     if not folder:
