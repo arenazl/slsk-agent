@@ -33,7 +33,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.7.5"
+VERSION = "2.8.0"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
