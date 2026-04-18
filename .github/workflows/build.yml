@@ -16,9 +16,18 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: pip install nuitka pystray pillow aiohttp aioslsk cloudinary ordered-set zstandard
+      - name: Cache Nuitka
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\Nuitka\Nuitka\Cache
+            .nuitka-cache
+          key: nuitka-${{ runner.os }}-py3.12-${{ hashFiles('agent.py') }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-py3.12-
       - name: Build with Nuitka
         run: |
-          python -m nuitka --onefile --assume-yes-for-downloads --enable-plugin=tk-inter --windows-icon-from-ico=icon.ico --company-name="GrooveSync" --product-name="GrooveSync Agent" --file-version=2.0.0 --product-version=2.0.0 --file-description="GrooveSync Local Agent" --windows-console-mode=disable --include-data-files=icon.ico=icon.ico --include-data-files=logo.png=logo.png --output-filename=GrooveSyncAgent.exe agent.py
+          python -m nuitka --onefile --jobs=4 --assume-yes-for-downloads --enable-plugin=tk-inter --windows-icon-from-ico=icon.ico --company-name="GrooveSync" --product-name="GrooveSync Agent" --file-version=2.0.0 --product-version=2.0.0 --file-description="GrooveSync Local Agent" --windows-console-mode=disable --include-data-files=icon.ico=icon.ico --include-data-files=logo.png=logo.png --output-filename=GrooveSyncAgent.exe agent.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
