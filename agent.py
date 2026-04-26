@@ -33,7 +33,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.8.1"
+VERSION = "2.9.0"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -1683,6 +1683,28 @@ async def logging_middleware(request, handler):
         raise
 
 
+def _ui_dist_dir() -> Path | None:
+    """Locate the bundled UI dist directory, if present."""
+    base = Path(__file__).parent / "ui-dist"
+    if base.exists() and (base / "index.html").exists():
+        return base
+    return None
+
+
+async def _serve_index(request):
+    ui = _ui_dist_dir()
+    if not ui:
+        return web.Response(status=404, text="UI not bundled. Open https://groovesyncdj.netlify.app instead.")
+    return web.FileResponse(ui / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+async def _serve_spa_fallback(request):
+    # Don't swallow unknown /api/* — let those 404 explicitly.
+    if request.path.startswith("/api/"):
+        return web.Response(status=404, text="Not found")
+    return await _serve_index(request)
+
+
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware, logging_middleware], client_max_size=500 * 1024 * 1024)  # 500 MB max upload
 
@@ -1708,6 +1730,21 @@ def create_app() -> web.Application:
     app.router.add_post("/api/refresh-charts", handle_refresh_charts)
     app.router.add_post("/api/restart", handle_restart)
     app.router.add_post("/api/slsk-download", handle_slsk_download)
+
+    # Serve the UI from the agent itself (when bundled). Lets you go to
+    # http://localhost:9900/ and skip Tailscale + cloud entirely for desktop use.
+    ui = _ui_dist_dir()
+    if ui:
+        if (ui / "assets").exists():
+            app.router.add_static("/assets", ui / "assets")
+        for fname in ("manifest.json", "service-worker.js", "favicon.ico", "favicon.png", "logo.png", "icon-192.png", "icon-512.png", "icon-192-v2.png", "icon-512-v2.png"):
+            fpath = ui / fname
+            if fpath.exists():
+                app.router.add_get(f"/{fname}", lambda req, p=fpath: web.FileResponse(p))
+        app.router.add_get("/", _serve_index)
+        # SPA fallback — must be last so explicit routes win
+        app.router.add_get("/{tail:.*}", _serve_spa_fallback)
+        log.info("Serving UI from %s", ui)
     return app
 
 
@@ -2016,6 +2053,7 @@ if sys.platform == "darwin":
                 quit_button=None,
             )
             self.menu = [
+                rumps.MenuItem("Abrir UI", callback=self.on_open_ui),
                 rumps.MenuItem("Abrir carpeta", callback=self.on_open_folder),
                 rumps.MenuItem("Configurar carpeta", callback=self.on_configure_folder),
                 rumps.separator,
@@ -2027,6 +2065,10 @@ if sys.platform == "darwin":
                 rumps.separator,
                 rumps.MenuItem("Salir", callback=self.on_quit),
             ]
+
+        def on_open_ui(self, _):
+            import webbrowser
+            webbrowser.open(f"http://localhost:{PORT}/")
 
         def on_open_folder(self, _):
             folder = get_download_folder()
@@ -2085,6 +2127,11 @@ if sys.platform == "darwin":
 # ---------------------------------------------------------------------------
 # Windows/Linux tray (pystray)
 # ---------------------------------------------------------------------------
+
+def _on_open_ui(icon, item):
+    import webbrowser
+    webbrowser.open(f"http://localhost:{PORT}/")
+
 
 def _on_open_folder(icon, item):
     folder = get_download_folder()
@@ -2168,6 +2215,7 @@ def run_tray(ready_event: threading.Event):
         _create_tray_icon(),
         f"Groove Sync v{VERSION} - Online",
         menu=pystray.Menu(
+            pystray.MenuItem("Abrir UI", _on_open_ui, default=True),
             pystray.MenuItem("Abrir carpeta", _on_open_folder),
             pystray.MenuItem("Configurar carpeta", _on_configure_folder),
             pystray.MenuItem("Renovar Charts", _on_refresh_charts),

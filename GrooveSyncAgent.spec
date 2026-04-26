@@ -1,11 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+import os
+_ui_data = [('ui-dist', 'ui-dist')] if os.path.isdir('ui-dist') else []
+
 a = Analysis(
     ['agent.py'],
     pathex=[],
     binaries=[],
-    datas=[('logo.png', '.'), ('logo_transparent.png', '.'), ('menubar_icon.png', '.')],
+    datas=[('logo.png', '.'), ('logo_transparent.png', '.'), ('menubar_icon.png', '.')] + _ui_data,
     hiddenimports=['rumps'],
     hookspath=[],
     hooksconfig={},
