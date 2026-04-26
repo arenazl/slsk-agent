@@ -33,7 +33,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 PORT = 9900
 ALLOWED_ORIGINS = [
     "https://groovesyncdj.netlify.app",
@@ -507,7 +507,12 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
         except Exception:
             finalized_ok = False
         if finalized_ok:
-            await report("completed", source=peer)
+            # Real on-disk filename — aioslsk uses the remote path's basename,
+            # which can differ from `filename` (the original search request name).
+            # The UI keys searchDlStatus by `filename` but needs `local_name` to
+            # check the file actually landed in local storage.
+            local_name = remote_path.rsplit("\\", 1)[-1] if "\\" in remote_path else remote_path.rsplit("/", 1)[-1]
+            await report("completed", source=peer, local_name=local_name)
             return
 
     await report("error", message="no sources succeeded")
@@ -807,14 +812,22 @@ async def handle_open_folder(request: web.Request):
         return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
 
     subfolder = request.query.get("folder", "")
+    file_name = request.query.get("file", "")
     target = Path(folder)
     if subfolder:
         target = target / subfolder
     target.mkdir(parents=True, exist_ok=True)
 
+    # If a specific file was requested AND it exists, reveal it (Explorer
+    # /select on Windows, Finder -R on macOS). Otherwise just open the folder.
+    file_path = (target / file_name) if file_name else None
     try:
-        _open_path(str(target))
-        log.info("Opened folder: %s", target)
+        if file_path and file_path.exists():
+            _reveal_path(str(file_path))
+            log.info("Revealed file: %s", file_path)
+        else:
+            _open_path(str(target))
+            log.info("Opened folder: %s", target)
     except Exception as e:
         log.exception("Failed to open folder")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -1830,6 +1843,22 @@ def _open_path(path):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def _reveal_path(path):
+    """Open the OS file manager with `path` selected/highlighted."""
+    if sys.platform == "win32":
+        # `explorer /select,"C:\path\to\file.flac"` opens the parent folder
+        # with the file pre-selected. Pass as a single string because
+        # explorer.exe parses /select, with comma-as-delimiter literally.
+        subprocess.Popen(f'explorer /select,"{path}"')
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", path])
+    else:
+        # Most Linux file managers don't support reveal-with-selection
+        # uniformly; open the parent folder instead.
+        parent = str(Path(path).parent)
+        subprocess.Popen(["xdg-open", parent])
 
 
 def _do_check_update(notify_fn=None):
