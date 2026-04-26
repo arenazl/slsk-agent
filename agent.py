@@ -778,6 +778,16 @@ async def handle_delete_dupes(request: web.Request):
     return web.json_response({"ok": True, "deleted": deleted_count, "files": deleted_files})
 
 
+_ILLEGAL_WIN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_genre(name: str) -> str:
+    if not name:
+        return ""
+    cleaned = _ILLEGAL_WIN_CHARS.sub("", name).strip().rstrip(". ")
+    return cleaned[:80]
+
+
 async def handle_organize(request: web.Request):
     body = await request.json()
     moves = body.get("moves", [])
@@ -787,14 +797,19 @@ async def handle_organize(request: web.Request):
 
     download_dir = Path(folder)
     moved_count = 0
+    skipped = 0
 
     for move in moves:
         fname = move.get("filename")
-        genre = move.get("genre")
+        genre = _sanitize_genre(move.get("genre", ""))
         if not fname or not genre:
+            skipped += 1
             continue
-        filepath = _find_file_in_library(fname)
-        if filepath and filepath.exists():
+        try:
+            filepath = _find_file_in_library(fname)
+            if not (filepath and filepath.exists()):
+                skipped += 1
+                continue
             dest_dir = download_dir / genre
             dest_dir.mkdir(exist_ok=True)
             dest = dest_dir / filepath.name
@@ -802,8 +817,11 @@ async def handle_organize(request: web.Request):
                 filepath.rename(dest)
                 moved_count += 1
                 log.info("Moved %s -> %s", filepath.name, genre)
+        except Exception as e:
+            log.warning("organize: failed %s -> %s: %s", fname, genre, e)
+            skipped += 1
 
-    return web.json_response({"ok": True, "moved": moved_count})
+    return web.json_response({"ok": True, "moved": moved_count, "skipped": skipped})
 
 
 async def handle_open_folder(request: web.Request):
