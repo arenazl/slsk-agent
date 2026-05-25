@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.11.0"
+VERSION = "2.12.0"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -433,8 +433,11 @@ async def get_slsk_client(username: str, password: str, force_relogin: bool = Fa
             credentials=CredentialsSettings(username=username, password=password),
             shares=SharesSettings(download=folder),
             network={
-                "listening": {"port": 64321, "port_range": 100},
-                "listening_obfuscated": {"port": 64421, "port_range": 100},
+                # Range alto poco usado. Antes era 64321/64421 pero alguno se
+                # bloqueaba en este python (probable Windows Firewall pidiendo
+                # confirmacion para python.exe). 53xxx es menos colisionado.
+                "listening": {"port": 53321, "port_range": 100},
+                "listening_obfuscated": {"port": 53421, "port_range": 100},
             },
         )
         client = SoulSeekClient(settings)
@@ -666,14 +669,17 @@ async def _run_slsk_search(username: str, password: str, query: str, search_wait
             if ext_raw not in _AUDIO_EXTS:
                 continue
 
-            # Relevance check
+            # Relevance check — MÁS LAXO que el server. Queremos traer MUCHOS
+            # candidates (~20-50) porque la mayoría tiene NAT y "indirect
+            # connection timed out". Más candidates = más chance de pegar uno
+            # que conecte. Filter actual: artist match obligatorio + al menos
+            # 1 keyword de title (no exigimos 50% match).
             full_norm = re.sub(r'[^\w\s]', ' ', (fname + ' ' + fname_full).lower())
             if _artist_kw:
                 if not any(w in full_norm for w in _artist_kw):
                     continue
-            if _title_kw and len(_title_kw) >= 2:
-                matches = sum(1 for w in _title_kw if w in full_norm)
-                if matches < max(2, -(-len(_title_kw) * 5 // 10)):
+            if _title_kw:
+                if not any(w in full_norm for w in _title_kw):
                     continue
 
             attrs = file.get_attribute_map()
@@ -852,6 +858,163 @@ async def handle_status(request: web.Request):
         "version": VERSION,
         "ffmpeg": ffmpeg_available,
         "slsk": AIOSLSK_AVAILABLE,
+        "tunnel": {
+            "running": _tunnel_task is not None and not _tunnel_task.done(),
+            "user": _tunnel_user,
+            "connected": _tunnel_connected,
+        },
+    })
+
+
+# ─── WS reverse tunnel (cliente) ─────────────────────────
+# Mantiene una conexion WS saliente al server (Heroku) por la cual el
+# server le manda HTTP requests que el agente ejecuta localmente y
+# devuelve por el mismo canal. Sin Tailscale, sin puerto abierto.
+_tunnel_task = None              # asyncio.Task | None
+_tunnel_user: str | None = None
+_tunnel_started_at: float | None = None
+_tunnel_connected: bool = False
+
+
+async def _tunnel_dispatch(data: dict) -> dict:
+    """Reemite un http_request hacia 127.0.0.1:PORT y devuelve la respuesta.
+    Usar el propio HTTP loopback nos da el routing y middlewares gratis."""
+    import aiohttp
+    import base64 as _b64
+    method = data.get("method", "GET")
+    path = data.get("path", "/")
+    query = data.get("query") or {}
+    in_headers = data.get("headers") or {}
+    body_b64 = data.get("body_b64")
+    body = _b64.b64decode(body_b64) if body_b64 else None
+    url = f"http://127.0.0.1:{PORT}{path}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.request(method, url, params=query,
+                                 headers=in_headers, data=body) as resp:
+                resp_body = await resp.read()
+                out_headers = {k: v for k, v in resp.headers.items()
+                               if k.lower() not in ("content-length", "transfer-encoding", "connection")}
+                return {
+                    "type": "http_response",
+                    "request_id": data.get("request_id"),
+                    "status": resp.status,
+                    "headers": out_headers,
+                    "body_b64": _b64.b64encode(resp_body).decode("ascii"),
+                }
+    except Exception as e:
+        log.warning("[TUNNEL] dispatch %s %s failed: %s", method, path, e)
+        return {
+            "type": "http_response",
+            "request_id": data.get("request_id"),
+            "status": 502,
+            "headers": {"Content-Type": "application/json"},
+            "body_b64": _b64.b64encode(json.dumps({"error": str(e)}).encode()).decode("ascii"),
+        }
+
+
+async def _tunnel_loop(username: str):
+    """Conecta WS a Heroku y queda escuchando. Reconnect con backoff."""
+    global _tunnel_connected
+    import aiohttp
+    ws_url = SERVER_URL.replace("https://", "wss://").replace("http://", "ws://")
+    ws_url = f"{ws_url}/agent-tunnel?u={username}"
+    backoff = 1.0
+    while True:
+        try:
+            log.info("[TUNNEL] connecting to %s", ws_url)
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=None)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(
+                    ws_url, heartbeat=30.0,
+                    max_msg_size=64 * 1024 * 1024,
+                ) as ws:
+                    _tunnel_connected = True
+                    backoff = 1.0
+                    log.info("[TUNNEL] connected as %s", username)
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                            except Exception:
+                                continue
+                            if data.get("type") == "http_request":
+                                # En background: no bloquea el read loop si el
+                                # dispatch tarda (downloads grandes, slsk search).
+                                async def _runone(d=data, w=ws):
+                                    resp = await _tunnel_dispatch(d)
+                                    try:
+                                        await w.send_json(resp)
+                                    except Exception as se:
+                                        log.warning("[TUNNEL] send response failed: %s", se)
+                                asyncio.create_task(_runone())
+                            elif data.get("type") == "pong":
+                                pass
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        ):
+                            break
+        except asyncio.CancelledError:
+            log.info("[TUNNEL] cancelled")
+            raise
+        except Exception as e:
+            log.warning("[TUNNEL] connection error: %s", e)
+        _tunnel_connected = False
+        log.info("[TUNNEL] disconnected — retry in %.1fs", backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60.0)
+
+
+async def handle_tunnel_start(request: web.Request):
+    """POST {user}. Arranca (o reabre) el tunnel WS al server con ese username.
+    Idempotente: si ya corre con el mismo user, devuelve already_running."""
+    global _tunnel_task, _tunnel_user, _tunnel_started_at
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user = (body.get("user") or request.query.get("user") or "").strip()
+    if not user:
+        return web.json_response({"ok": False, "error": "missing user"}, status=400)
+    if _tunnel_task and not _tunnel_task.done() and _tunnel_user == user:
+        return web.json_response({"ok": True, "user": user, "status": "already_running"})
+    if _tunnel_task and not _tunnel_task.done():
+        _tunnel_task.cancel()
+        try:
+            await _tunnel_task
+        except Exception:
+            pass
+    _tunnel_user = user
+    _tunnel_started_at = time.time()
+    _tunnel_task = asyncio.create_task(_tunnel_loop(user))
+    return web.json_response({"ok": True, "user": user, "status": "started"})
+
+
+async def handle_tunnel_stop(request: web.Request):
+    global _tunnel_task, _tunnel_user, _tunnel_connected
+    if _tunnel_task and not _tunnel_task.done():
+        _tunnel_task.cancel()
+        try:
+            await _tunnel_task
+        except Exception:
+            pass
+    prev_user = _tunnel_user
+    _tunnel_task = None
+    _tunnel_user = None
+    _tunnel_connected = False
+    return web.json_response({"ok": True, "stopped_user": prev_user})
+
+
+async def handle_tunnel_status(request: web.Request):
+    return web.json_response({
+        "running": _tunnel_task is not None and not _tunnel_task.done(),
+        "user": _tunnel_user,
+        "connected": _tunnel_connected,
+        "started_at": _tunnel_started_at,
+        "server_url": SERVER_URL,
     })
 
 
@@ -2023,6 +2186,9 @@ def create_app() -> web.Application:
     app.router.add_post("/api/restart", handle_restart)
     app.router.add_post("/api/slsk-download", handle_slsk_download)
     app.router.add_post("/api/slsk-search", handle_slsk_search)
+    app.router.add_post("/api/tunnel-start", handle_tunnel_start)
+    app.router.add_post("/api/tunnel-stop", handle_tunnel_stop)
+    app.router.add_get("/api/tunnel-status", handle_tunnel_status)
 
     # Serve the UI from the agent itself (when bundled). Lets you go to
     # http://localhost:9900/ and skip Tailscale + cloud entirely for desktop use.
@@ -2641,6 +2807,21 @@ async def beatport_scrape_loop():
         await asyncio.sleep(BEATPORT_SCRAPE_INTERVAL)
 
 
+def _maybe_start_tunnel(loop):
+    """Auto-start del WS reverse tunnel si config.json tiene username.
+    Sin esto el .exe queda con tunnel-running=false y la UI cloud no lo alcanza."""
+    global _tunnel_task, _tunnel_user, _tunnel_started_at
+    cfg = load_config()
+    user = (cfg.get("username") or "").strip()
+    if not user:
+        log.info("[TUNNEL] no username in config — skipping auto-start")
+        return
+    _tunnel_user = user
+    _tunnel_started_at = time.time()
+    _tunnel_task = loop.create_task(_tunnel_loop(user))
+    log.info("[TUNNEL] auto-starting for user %s", user)
+
+
 def _run_server_in_thread():
     """Run the async HTTP server in a background thread."""
     loop = asyncio.new_event_loop()
@@ -2648,6 +2829,7 @@ def _run_server_in_thread():
     try:
         runner = loop.run_until_complete(start_server())
         loop.create_task(beatport_scrape_loop())
+        _maybe_start_tunnel(loop)
         log.info("Agent ready — listening on port %d", PORT)
         loop.run_forever()
     except Exception as e:
@@ -2684,6 +2866,7 @@ def main():
         try:
             runner = loop.run_until_complete(start_server())
             loop.create_task(beatport_scrape_loop())
+            _maybe_start_tunnel(loop)
             log.info("Agent ready — listening on port %d", PORT)
             loop.run_forever()
         except KeyboardInterrupt:
