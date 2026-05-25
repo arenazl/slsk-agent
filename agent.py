@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import shutil
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import pystray
@@ -25,6 +27,8 @@ from aiohttp import web
 try:
     from aioslsk.client import SoulSeekClient
     from aioslsk.settings import Settings, CredentialsSettings, SharesSettings
+    from aioslsk.events import SearchResultEvent
+    from aioslsk.protocol.primitives import AttributeKey
     AIOSLSK_AVAILABLE = True
 except ImportError:
     AIOSLSK_AVAILABLE = False
@@ -33,15 +37,20 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.9.0"
+VERSION = "2.11.0"
 PORT = 9900
+HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
-    "https://groovesyncdj.netlify.app",
+    "https://djfreeapp.ar",
+    "https://www.djfreeapp.ar",
+    "https://groovesyncdj.netlify.app",  # legacy, kept for compat
     "https://slsk-ui.netlify.app",
     "http://localhost:5173",
     "http://localhost:5174",
     "http://localhost:5175",
 ]
+# Allow any *.djfreeapp.ar / *.netlify.app subdomain too
+ALLOWED_ORIGIN_SUFFIXES = (".djfreeapp.ar", ".netlify.app")
 SERVER_URL = "https://slsk-backend-7da97b8a965d.herokuapp.com"
 AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".wav", ".aif", ".aiff",
@@ -61,7 +70,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -325,6 +334,21 @@ def _find_file_in_library(filename: str) -> Path | None:
     return None
 
 
+def _safe_join(folder: str, rel: str) -> Path | None:
+    """Join `folder` and `rel` and verify the resolved path is inside `folder`.
+
+    Returns None if `rel` tries to escape via `..`, absolute paths, or symlinks.
+    Used to harden file-serving endpoints against path-traversal attacks.
+    """
+    try:
+        root = Path(folder).resolve()
+        target = (root / rel).resolve()
+        target.relative_to(root)
+        return target
+    except (ValueError, OSError):
+        return None
+
+
 def _file_size_mb(path: Path) -> float:
     return round(path.stat().st_size / (1024 * 1024), 2)
 
@@ -356,7 +380,7 @@ async def cors_middleware(request: web.Request, handler):
         except web.HTTPException as ex:
             resp = ex
 
-    if origin in ALLOWED_ORIGINS:
+    if origin in ALLOWED_ORIGINS or any(origin.endswith(suf) for suf in ALLOWED_ORIGIN_SUFFIXES):
         resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Access-Control-Request-Private-Network"
@@ -372,18 +396,32 @@ async def cors_middleware(request: web.Request, handler):
 _slsk_client = None
 _slsk_lock = asyncio.Lock()
 _slsk_credentials = None  # (username, password) currently logged in
+_slsk_login_at = 0.0      # epoch del último login (para detectar sesiones viejas)
+_SLSK_SESSION_TTL = 300   # 5 min — re-loginar si la session es más vieja
 
-async def get_slsk_client(username: str, password: str):
+async def get_slsk_client(username: str, password: str, force_relogin: bool = False):
     """Return a live SoulSeek client, reusing the existing login when possible.
     Connection is kept alive across calls — login is expensive and peer-reputation
-    improves with long-lived connections (Nicotine+ pattern)."""
-    global _slsk_client, _slsk_credentials
+    improves with long-lived connections (Nicotine+ pattern).
+
+    `force_relogin=True` cierra el client actual y reconecta — usado cuando una
+    search devuelve 0 results y sospechamos que la session expiró silenciosamente
+    (aioslsk loguea WARNING "no valid session was set" pero no levanta exception).
+    """
+    global _slsk_client, _slsk_credentials, _slsk_login_at
     if not AIOSLSK_AVAILABLE:
         raise RuntimeError("aioslsk not installed. Run: pip install aioslsk")
     async with _slsk_lock:
-        if _slsk_client is not None and _slsk_credentials == (username, password):
+        session_age = time.time() - _slsk_login_at
+        session_alive = (
+            _slsk_client is not None
+            and _slsk_credentials == (username, password)
+            and session_age < _SLSK_SESSION_TTL
+            and not force_relogin
+        )
+        if session_alive:
             return _slsk_client
-        # Creds changed or no client yet — (re)connect
+        # Creds changed, session vieja, o force → reconectar
         if _slsk_client is not None:
             try:
                 await _slsk_client.stop()
@@ -404,7 +442,8 @@ async def get_slsk_client(username: str, password: str):
         await client.login()
         _slsk_client = client
         _slsk_credentials = (username, password)
-        log.info("SoulSeek client connected as %s", username)
+        _slsk_login_at = time.time()
+        log.info("SoulSeek client connected as %s (age reset, ttl=%ds)", username, _SLSK_SESSION_TTL)
         return _slsk_client
 
 
@@ -516,6 +555,257 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
             return
 
     await report("error", message="no sources succeeded")
+
+
+_AUDIO_EXTS = {"mp3", "flac", "wav", "aiff", "aif", "m4a", "ogg", "opus"}
+
+
+def _build_search_ladder(query: str) -> list:
+    """Genera queries progresivamente más simples — replica la lógica del
+    server. Iteramos en orden hasta encontrar resultados con cola baja."""
+    STOPWORDS = {'feat', 'featuring', 'ft', 'with', 'and', 'the', 'a', 'an',
+                 'mix', 'extended', 'original', 'radio', 'edit', 'club',
+                 'remix', 'version', 'vocal', 'instrumental', 'dub', 'vip',
+                 'rework', 'bootleg'}
+    queries = []
+    base = re.sub(r'\([^)]*\)', ' ', query)
+    base = re.sub(r'\[[^\]]*\]', ' ', base)
+    for suf in ['Extended Mix', 'Original Mix', 'Radio Edit', 'Club Mix',
+                'Remix', 'Extended', 'Original']:
+        base = re.sub(rf'\b{re.escape(suf)}\b', ' ', base, flags=re.IGNORECASE)
+    base = re.sub(r'\s+', ' ', base).strip()
+
+    artist_part, title_part = None, None
+    for sep in [' - ', ' – ', ' — ']:
+        if sep in base:
+            parts = base.split(sep, 1)
+            artist_part = parts[0].strip()
+            title_part = parts[1].strip() if len(parts) > 1 else ''
+            break
+
+    def _strip(s): return re.sub(r'[^\w\s]', ' ', s).strip()
+
+    queries.append(_strip(base))
+    if artist_part and title_part:
+        artists = re.split(r'\s*(?:,|&|\sand\s|\sft\.?\s|\sfeat\.?\s|\swith\s)\s*',
+                           artist_part, flags=re.IGNORECASE)
+        artists = [a.strip() for a in artists if a.strip()]
+        if len(artists) > 1:
+            queries.append(_strip(f"{artists[-1]} {title_part}"))
+            queries.append(_strip(f"{artists[0]} {title_part}"))
+        queries.append(_strip(title_part))
+        title_words = [w for w in _strip(title_part).lower().split()
+                       if len(w) >= 3 and w not in STOPWORDS]
+        if len(title_words) >= 2:
+            queries.append(' '.join(title_words[:3]))
+    else:
+        words = _strip(base).split()
+        if len(words) > 2:
+            distinctive = [w for w in words if len(w) >= 3 and w.lower() not in STOPWORDS]
+            if len(distinctive) >= 2:
+                queries.append(' '.join(distinctive[:3]))
+
+    # Dedup preserving order
+    seen, out = set(), []
+    for q in queries:
+        q = re.sub(r'\s+', ' ', q).strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+    return out
+
+
+async def _run_slsk_search(username: str, password: str, query: str, search_wait: int = 20):
+    """Search SoulSeek for `query` and return a list of audio candidates.
+    Replica simplificada de _search_soulseek_impl del server, pero corre
+    en la red local del usuario → ve peers normales que Heroku no alcanza."""
+    client = await get_slsk_client(username, password)
+
+    _stopw = {"mix", "the", "and", "ext", "original", "feat", "featuring",
+              "remix", "extended", "edit", "club", "radio", "vocal"}
+
+    # El artist de Beatport suele ser fake ("Jesus Fernandez" para una cover
+    # de Danny Tenaglia). Por eso recalculamos artist_kw/title_kw POR ITERACIÓN:
+    # query 1 (full) usa artist filter; query 2+ (title only) lo ignora.
+    def _kw_for(q: str):
+        if " - " in q:
+            _parts = q.split(" - ", 1)
+            ap = _parts[0]
+            tp = _parts[1] if len(_parts) > 1 else ""
+        else:
+            ap = ""
+            tp = q
+        ak = [w for w in re.sub(r'[^\w\s]', ' ', ap.lower()).split()
+              if len(w) >= 3 and w not in _stopw]
+        tk = [w for w in re.sub(r'[^\w\s]', ' ', tp.lower()).split()
+              if len(w) >= 3 and w not in _stopw]
+        return ak, tk
+
+    # Ladder de queries: si la primera (más específica) no trae resultados con
+    # cola baja, probamos progresivamente más simples — igual que el server.
+    search_queries = _build_search_ladder(query)
+    log.info("[agent search] query=%r ladder=%s", query, search_queries)
+
+    # El artist_kw lo derivamos UNA VEZ del query ORIGINAL (que tiene "Artist - Title"),
+    # porque las queries del ladder se simplifican y pierden el separador. Sin esto,
+    # un track "Jesus Fernandez - Music Is The Answer" devuelve también las versiones
+    # de Danny Tenaglia (matchean por title) — el user quiere SOLO el artist pedido.
+    orig_artist_kw, _ = _kw_for(query)
+
+    candidates = []
+
+    # _artist_kw queda fijo (siempre filtra por el artist original).
+    # _title_kw se recalcula por iteración (sigue al ladder).
+    _artist_kw, _title_kw = list(orig_artist_kw), []
+
+    async def on_result(event):
+        for file in event.result.shared_items:
+            fname_full = file.filename
+            fname = fname_full.rsplit("\\", 1)[-1] if "\\" in fname_full else fname_full.rsplit("/", 1)[-1]
+            ext_raw = (file.extension or fname.rsplit(".", 1)[-1] if "." in fname else "").lower()
+            if ext_raw not in _AUDIO_EXTS:
+                continue
+
+            # Relevance check
+            full_norm = re.sub(r'[^\w\s]', ' ', (fname + ' ' + fname_full).lower())
+            if _artist_kw:
+                if not any(w in full_norm for w in _artist_kw):
+                    continue
+            if _title_kw and len(_title_kw) >= 2:
+                matches = sum(1 for w in _title_kw if w in full_norm)
+                if matches < max(2, -(-len(_title_kw) * 5 // 10)):
+                    continue
+
+            attrs = file.get_attribute_map()
+            bitrate = attrs.get(AttributeKey.BITRATE, 0) or 0
+            duration = attrs.get(AttributeKey.DURATION, 0) or 0
+            size_mb = (file.filesize or 0) / (1024 * 1024)
+
+            candidates.append({
+                "username": event.result.username,
+                "filename": fname,
+                "remote_path": fname_full,
+                "ext": ext_raw.upper(),
+                "size_mb": round(size_mb, 1),
+                "bitrate": bitrate,
+                "duration": duration,
+                "free_slots": event.result.has_free_slots,
+                "speed": event.result.avg_speed or 0,
+                "queue": event.result.queue_size or 0,
+            })
+
+    # Mandamos TODAS las queries del ladder en paralelo y dejamos al filter de
+    # _artist_kw (siempre constante) decidir qué entra. Lanzar en paralelo es
+    # mucho más eficiente que esperar 20s por query secuencial y junta más
+    # peers (algunos solo responden a queries más cortas).
+    _artist_kw = list(orig_artist_kw)
+    # El _title_kw lo cubrimos con las palabras de TODOS los queries del ladder
+    # (unión) — más laxo, pero el artist filter ya restringe lo suficiente.
+    _title_kw = []
+    for sq in search_queries:
+        _, tk = _kw_for(sq)
+        for w in tk:
+            if w not in _title_kw:
+                _title_kw.append(w)
+
+    client.events.register(SearchResultEvent, on_result)
+    search_reqs = []
+    try:
+        for sq in search_queries:
+            try:
+                req = await client.searches.search(sq)
+                search_reqs.append(req)
+            except Exception as e:
+                log.warning("[agent search] failed to start %r: %s", sq, e)
+        await asyncio.sleep(search_wait)
+    finally:
+        client.events.unregister(SearchResultEvent, on_result)
+        for req in search_reqs:
+            try:
+                client.searches.remove_request(req)
+            except Exception:
+                pass
+    log.info("[agent search] parallel ladder done: %d queries akw=%s tkw=%s -> %d raw candidates",
+             len(search_queries), _artist_kw, _title_kw, len(candidates))
+
+    # Dedupe sources of the same logical file (same ext + duration ±5s + size ±10%)
+    grouped = []
+    for c in candidates:
+        merged = False
+        for g in grouped:
+            same_ext = c["ext"] == g["ext"]
+            same_dur = abs((c["duration"] or 0) - (g["duration"] or 0)) <= 5
+            sa, sb = c["size_mb"], g["size_mb"]
+            same_size = sa and sb and abs(sa - sb) / max(sa, sb) <= 0.10
+            if same_ext and same_dur and same_size:
+                g.setdefault("sources", [g.copy()])
+                g["sources"].append(c)
+                if (c.get("queue", 9999) < g.get("queue", 9999)) or (c.get("free_slots") and not g.get("free_slots")):
+                    g["username"] = c["username"]
+                    g["queue"] = c["queue"]
+                    g["free_slots"] = c["free_slots"]
+                    g["speed"] = c["speed"]
+                merged = True
+                break
+        if not merged:
+            grouped.append(c)
+    for g in grouped:
+        g["source_count"] = len(g.get("sources", [g]))
+
+    # Sort: free slots first, then queue ASC, then quality DESC (FLAC > MP3)
+    def _qual(r):
+        e = r.get("ext", "").lower()
+        if e in ("flac", "wav"): return 1000
+        if e in ("aiff", "aif"): return 900
+        if e == "mp3": return 300 + min(r.get("bitrate", 0) or 0, 320)
+        return 100
+    grouped.sort(key=lambda r: (
+        0 if r.get("free_slots") else 1,
+        r.get("queue", 9999),
+        -_qual(r),
+    ))
+    return grouped
+
+
+async def handle_slsk_search(request: web.Request):
+    """Search SoulSeek via the local agent (sees peers Heroku NAT can't reach).
+    Body: {username, password, query, wait?:20}. Returns {ok, results:[...]}.
+    Synchronous — UI awaits the full result list."""
+    if not AIOSLSK_AVAILABLE:
+        return web.json_response(
+            {"ok": False, "error": "aioslsk not installed on agent"},
+            status=501,
+        )
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    username = data.get("username")
+    password = data.get("password")
+    query = (data.get("query") or "").strip()
+    wait_s = int(data.get("wait") or 20)
+
+    if not username or not password or not query:
+        return web.json_response(
+            {"ok": False, "error": "Missing username/password/query"},
+            status=400,
+        )
+
+    try:
+        results = await _run_slsk_search(username, password, query, search_wait=wait_s)
+        # Si vino 0 resultados, la session pudo haber expirado silenciosamente
+        # (aioslsk: "WARNING: not returning search results: no valid session").
+        # Retry UNA vez forzando re-login del SoulSeek client.
+        if not results:
+            log.warning("[slsk-search] 0 results — force relogin and retry")
+            await get_slsk_client(username, password, force_relogin=True)
+            results = await _run_slsk_search(username, password, query, search_wait=wait_s)
+    except Exception as e:
+        log.exception("slsk-search error")
+        return web.json_response({"ok": False, "error": str(e)[:200]}, status=500)
+
+    return web.json_response({"ok": True, "results": results, "count": len(results)})
 
 
 async def handle_slsk_download(request: web.Request):
@@ -704,7 +994,6 @@ async def handle_config(request: web.Request):
         config["username"] = username
         save_config(config)
         log.info("Username linked: %s", username)
-        asyncio.ensure_future(_register_agent_ip())
 
     if "primary" in body:
         config = load_config()
@@ -865,7 +1154,7 @@ def _cors_headers(request):
         "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
         "Access-Control-Expose-Headers": "Content-Range, Content-Length",
     }
-    if origin in ALLOWED_ORIGINS:
+    if origin in ALLOWED_ORIGINS or any(origin.endswith(suf) for suf in ALLOWED_ORIGIN_SUFFIXES):
         h["Access-Control-Allow-Origin"] = origin
     return h
 
@@ -881,8 +1170,8 @@ async def handle_audio(request: web.Request):
         return web.json_response({"error": "Missing file path"}, status=400)
 
     # Try direct path first, then search by filename
-    target = Path(folder) / rel
-    if not target.exists() or not target.is_file():
+    target = _safe_join(folder, rel)
+    if not target or not target.exists() or not target.is_file():
         target = _find_file_in_library(Path(rel).name)
         if not target or not target.exists():
             return web.json_response({"error": "File not found"}, status=404)
@@ -1162,8 +1451,8 @@ async def handle_track_info(request: web.Request):
         return web.json_response({"error": "Missing file path"}, status=400)
 
     # Try subfolder/filename path first, then search by filename
-    target = Path(folder) / rel
-    if not target.exists() or not target.is_file():
+    target = _safe_join(folder, rel)
+    if not target or not target.exists() or not target.is_file():
         target = _find_file_in_library(Path(rel).name)
         if not target or not target.exists():
             return web.json_response({"error": "File not found"}, status=404)
@@ -1202,7 +1491,8 @@ async def handle_track_info(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 
-_analysis_cache = {}  # path -> { intro_end, outro_start, duration }
+_ANALYSIS_CACHE_MAX = 2000  # LRU cap — analyses are tiny (~100 bytes each)
+_analysis_cache: "OrderedDict[str, dict]" = OrderedDict()  # path -> analysis result
 
 
 async def handle_track_analysis(request: web.Request):
@@ -1231,12 +1521,13 @@ async def handle_track_analysis(request: web.Request):
             "duration": entry.get("duration", 0),
         })
 
-    # Check in-memory cache
+    # Check in-memory cache (LRU touch on hit)
     if rel in _analysis_cache:
+        _analysis_cache.move_to_end(rel)
         return web.json_response(_analysis_cache[rel])
 
-    target = Path(folder) / rel
-    if not target.exists() or not target.is_file():
+    target = _safe_join(folder, rel)
+    if not target or not target.exists() or not target.is_file():
         target = _find_file_in_library(Path(rel).name)
         if not target or not target.exists():
             return web.json_response({"error": "File not found"}, status=404)
@@ -1346,6 +1637,9 @@ async def handle_track_analysis(request: web.Request):
     try:
         result = await asyncio.get_event_loop().run_in_executor(None, analyze, target)
         _analysis_cache[rel] = result
+        _analysis_cache.move_to_end(rel)
+        while len(_analysis_cache) > _ANALYSIS_CACHE_MAX:
+            _analysis_cache.popitem(last=False)
         # Also persist to manifest so we never re-analyze
         upsert_manifest(fname, result)
         return web.json_response(result)
@@ -1538,28 +1832,30 @@ async def handle_refresh_charts(request: web.Request):
 # ---------------------------------------------------------------------------
 
 async def handle_restart(request: web.Request):
-    """Check for update from GitHub Releases, download if available, and restart."""
+    """Check for update from public manifest hosted on Netlify, download if
+    available, and restart. Uses djfreeapp.ar/agent/version.json instead of
+    GitHub API to avoid 2FA / private repo issues."""
     import urllib.request
 
     update_msg = ""
     try:
-        url = "https://api.github.com/repos/arenazl/slsk-agent/releases/latest"
-        req = urllib.request.Request(url, headers={"User-Agent": "GrooveSyncAgent"})
+        url = "https://djfreeapp.ar/agent/version.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "DJFreeAppAgent"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        latest = data.get("tag_name", "").lstrip("v")
+        latest = (data.get("version", "") or "").lstrip("v")
         current = VERSION
+        # Manifest schema: { version, windows_url, macos_url }
+        # Backwards-compat: also accept GitHub-style "assets" array.
+        win_url = data.get("windows_url") or "https://djfreeapp.ar/GrooveSyncAgent.exe"
+        mac_url = data.get("macos_url") or "https://djfreeapp.ar/GrooveSyncAgent-macOS.zip"
 
         if latest > current:
             log.info("Update available: v%s -> v%s", current, latest)
 
             if sys.platform == "darwin":
                 import zipfile
-                zip_url = None
-                for asset in data.get("assets", []):
-                    if asset["name"].endswith("-macOS.zip"):
-                        zip_url = asset["browser_download_url"]
-                        break
+                zip_url = mac_url
                 if zip_url:
                     tmp_zip = Path("/tmp") / "GrooveSyncAgent-macOS.zip"
                     tmp_extract = Path("/tmp") / "GrooveSyncAgent_update"
@@ -1595,11 +1891,7 @@ rm -f "$0"
                     update_msg = "No se encontró build macOS en el release"
             else:
                 # Windows
-                exe_url = None
-                for asset in data.get("assets", []):
-                    if asset["name"].endswith(".exe"):
-                        exe_url = asset["browser_download_url"]
-                        break
+                exe_url = win_url
                 if exe_url:
                     tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "GrooveSyncAgent_update.exe"
                     log.info("Downloading update from %s", exe_url)
@@ -1730,6 +2022,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/refresh-charts", handle_refresh_charts)
     app.router.add_post("/api/restart", handle_restart)
     app.router.add_post("/api/slsk-download", handle_slsk_download)
+    app.router.add_post("/api/slsk-search", handle_slsk_search)
 
     # Serve the UI from the agent itself (when bundled). Lets you go to
     # http://localhost:9900/ and skip Tailscale + cloud entirely for desktop use.
@@ -1748,82 +2041,14 @@ def create_app() -> web.Application:
     return app
 
 
-def _get_local_ip():
-    """Get the local network IP address of this machine."""
-    import socket
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return None
-
-
-def _get_tailscale_funnel_url():
-    """Detect Tailscale Funnel HTTPS URL if active."""
-    import subprocess
-    try:
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        out = subprocess.check_output(["tailscale", "funnel", "status"], text=True, timeout=5, startupinfo=si)
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("https://") and ".ts.net" in line:
-                # Line like: "https://lookpcnew.tail4ac337.ts.net (Funnel on)"
-                url = line.split()[0].rstrip("/")
-                return url
-    except Exception:
-        pass
-    return None
-
-
-async def _register_agent_ip():
-    """Register this agent's public URL with the cloud server so mobile/remote clients can connect."""
-    config = load_config()
-    username = config.get("username")
-    if not username:
-        log.info("No username configured, skipping agent registration")
-        return
-    # Prefer Tailscale Funnel (HTTPS, works from internet)
-    agent_host = _get_tailscale_funnel_url()
-    if not agent_host:
-        local_ip = _get_local_ip()
-        if not local_ip:
-            log.warning("Could not determine agent host")
-            return
-        agent_host = f"http://{local_ip}:{PORT}"
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            await session.post(f"{SERVER_URL}/api/agent/register", json={
-                "username": username,
-                "agent_host": agent_host,
-            })
-        log.info("Registered agent host %s for user %s", agent_host, username)
-    except Exception as e:
-        log.warning("Failed to register agent: %s", e)
-
-
 async def start_server():
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, HOST, PORT)
     await site.start()
-    log.info("HTTP server running on http://0.0.0.0:%d", PORT)
-    # Register agent IP with cloud server periodically so mobile clients can find us
-    asyncio.ensure_future(_register_agent_loop())
+    log.info("HTTP server running on http://%s:%d", HOST, PORT)
     return runner
-
-
-async def _register_agent_loop():
-    """Register agent IP on startup and every 4 minutes (server TTL is 5 min)."""
-    while True:
-        await _register_agent_ip()
-        await asyncio.sleep(240)
 
 
 # ---------------------------------------------------------------------------
@@ -1922,11 +2147,11 @@ def _do_check_update(notify_fn=None):
     if notify_fn is None:
         notify_fn = lambda msg: None
     try:
-        url = "https://api.github.com/repos/arenazl/slsk-agent/releases/latest"
-        req = urllib.request.Request(url, headers={"User-Agent": "GrooveSyncAgent"})
+        url = "https://djfreeapp.ar/agent/version.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "DJFreeAppAgent"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        latest = data.get("tag_name", "").lstrip("v")
+        latest = (data.get("version", "") or "").lstrip("v")
         current = VERSION
         if latest <= current:
             log.info("Already up to date: v%s", current)
@@ -1934,15 +2159,12 @@ def _do_check_update(notify_fn=None):
             return
 
         log.info("New version available: v%s -> v%s", current, latest)
+        win_url = data.get("windows_url") or "https://djfreeapp.ar/GrooveSyncAgent.exe"
+        mac_url = data.get("macos_url") or "https://djfreeapp.ar/GrooveSyncAgent-macOS.zip"
 
         if sys.platform == "darwin":
             import zipfile
-            # Find macOS zip asset in release
-            zip_url = None
-            for asset in data.get("assets", []):
-                if asset["name"].endswith("-macOS.zip"):
-                    zip_url = asset["browser_download_url"]
-                    break
+            zip_url = mac_url
             if not zip_url:
                 log.error("No macOS zip found in release")
                 notify_fn("No se encontró build de macOS en el release")
@@ -1991,13 +2213,9 @@ rm -f "$0"
                 notify_fn("Actualización solo disponible en .app compilado")
                 shutil.rmtree(tmp_extract, ignore_errors=True)
         else:
-            exe_url = None
-            for asset in data.get("assets", []):
-                if asset["name"].endswith(".exe"):
-                    exe_url = asset["browser_download_url"]
-                    break
+            exe_url = win_url
             if not exe_url:
-                log.error("No exe found in release")
+                log.error("No exe url in manifest")
                 return
 
             tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "GrooveSyncAgent_update.exe"
@@ -2048,7 +2266,7 @@ if sys.platform == "darwin":
                     icon_path = str(p)
                     break
             super().__init__(
-                "Groove Sync",
+                "DJ Free App",
                 icon=icon_path,
                 quit_button=None,
             )
@@ -2087,20 +2305,20 @@ if sys.platform == "darwin":
         def on_status(self, _):
             folder = get_download_folder() or "(no configurada)"
             rumps.notification(
-                "Groove Sync Agent",
+                "DJ Free App Agent",
                 f"v{VERSION} - Puerto {PORT}",
                 f"Carpeta: {folder}",
             )
 
         def on_refresh_charts(self, _):
             log.info("Manual chart refresh requested")
-            rumps.notification("Groove Sync Agent", "", "Renovando charts...")
+            rumps.notification("DJ Free App Agent", "", "Renovando charts...")
             def do_scrape():
                 loop = asyncio.new_event_loop()
                 try:
                     count = loop.run_until_complete(scrape_beatport_charts())
                     log.info("Manual scrape done: %d charts", count)
-                    rumps.notification("Groove Sync Agent", "", f"Charts actualizados: {count} géneros")
+                    rumps.notification("DJ Free App Agent", "", f"Charts actualizados: {count} géneros")
                 except Exception as e:
                     log.error("Manual scrape failed: %s", e)
                 finally:
@@ -2114,7 +2332,7 @@ if sys.platform == "darwin":
             log.info("Checking for updates...")
             def do():
                 _do_check_update(
-                    notify_fn=lambda msg: rumps.notification("Groove Sync Agent", "", msg)
+                    notify_fn=lambda msg: rumps.notification("DJ Free App Agent", "", msg)
                 )
             threading.Thread(target=do, daemon=True).start()
 
@@ -2154,7 +2372,7 @@ def _on_status(icon, item):
     try:
         icon.notify(
             f"Carpeta: {folder}\nPuerto: {PORT}\nVersion: {VERSION}",
-            "Groove Sync Agent",
+            "DJ Free App Agent",
         )
     except Exception:
         log.info("Status — Folder: %s, Port: %d, Version: %s", folder, PORT, VERSION)
@@ -2163,7 +2381,7 @@ def _on_status(icon, item):
 def _on_refresh_charts(icon, item):
     log.info("Manual chart refresh requested")
     try:
-        icon.notify("Renovando charts...", "Groove Sync Agent")
+        icon.notify("Renovando charts...", "DJ Free App Agent")
     except Exception:
         pass
     def do_scrape():
@@ -2172,7 +2390,7 @@ def _on_refresh_charts(icon, item):
             count = loop.run_until_complete(scrape_beatport_charts())
             log.info("Manual scrape done: %d charts", count)
             try:
-                icon.notify(f"Charts actualizados: {count} géneros", "Groove Sync Agent")
+                icon.notify(f"Charts actualizados: {count} géneros", "DJ Free App Agent")
             except Exception:
                 pass
         except Exception as e:
@@ -2189,13 +2407,13 @@ def _on_view_logs(icon, item):
 def _on_update(icon, item):
     log.info("Checking for updates...")
     try:
-        icon.notify("Buscando actualizaciones...", "Groove Sync Agent")
+        icon.notify("Buscando actualizaciones...", "DJ Free App Agent")
     except Exception:
         pass
     def do():
         def notify_fn(msg):
             try:
-                icon.notify(msg, "Groove Sync Agent")
+                icon.notify(msg, "DJ Free App Agent")
             except Exception:
                 pass
         _do_check_update(notify_fn)
@@ -2213,7 +2431,7 @@ def run_tray(ready_event: threading.Event):
     icon = pystray.Icon(
         "groovesync",
         _create_tray_icon(),
-        f"Groove Sync v{VERSION} - Online",
+        f"DJ Free App v{VERSION} - Online",
         menu=pystray.Menu(
             pystray.MenuItem("Abrir UI", _on_open_ui, default=True),
             pystray.MenuItem("Abrir carpeta", _on_open_folder),
@@ -2440,7 +2658,7 @@ def _run_server_in_thread():
 
 
 def main():
-    log.info("=== Groove Sync Agent v%s starting ===", VERSION)
+    log.info("=== DJ Free App Agent v%s starting ===", VERSION)
 
     # First run setup (folder picker)
     first_run_setup()

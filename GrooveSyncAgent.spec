@@ -38,7 +38,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['logo.png'],
+    icon=['icon.ico'],
 )
 app = BUNDLE(
     exe,
@@ -47,6 +47,6 @@ app = BUNDLE(
     bundle_identifier='com.groovesync.agent',
     info_plist={
         'LSUIElement': True,
-        'CFBundleShortVersionString': '2.7.5',
+        'CFBundleShortVersionString': '2.10.0',
     },
 )
