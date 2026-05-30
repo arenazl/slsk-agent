@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.0"
+VERSION = "2.12.1"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -1288,13 +1288,22 @@ async def handle_open_folder(request: web.Request):
         target = target / subfolder
     target.mkdir(parents=True, exist_ok=True)
 
-    # If a specific file was requested AND it exists, reveal it (Explorer
-    # /select on Windows, Finder -R on macOS). Otherwise just open the folder.
+    # Si vino `file`, el caller queria resaltar ese archivo especifico.
+    # Si NO existe, devolvemos 404 con mensaje claro en vez de fallback a
+    # "abrir la carpeta" — sino el user ve la carpeta abrirse y cree que
+    # algo anda mal porque no esta el tema seleccionado.
     file_path = (target / file_name) if file_name else None
     try:
-        if file_path and file_path.exists():
-            _reveal_path(str(file_path))
-            log.info("Revealed file: %s", file_path)
+        if file_name:
+            if file_path and file_path.exists():
+                _reveal_path(str(file_path))
+                log.info("Revealed file: %s", file_path)
+            else:
+                log.info("File not found, returning 404: %s", file_path)
+                return web.json_response(
+                    {"ok": False, "error": f"Archivo no encontrado: {file_name}"},
+                    status=404,
+                )
         else:
             _open_path(str(target))
             log.info("Opened folder: %s", target)
