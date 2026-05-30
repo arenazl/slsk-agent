@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.1"
+VERSION = "2.12.2"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -799,7 +799,20 @@ async def handle_slsk_search(request: web.Request):
         )
 
     try:
-        results = await _run_slsk_search(username, password, query, search_wait=wait_s)
+        try:
+            results = await _run_slsk_search(username, password, query, search_wait=wait_s)
+        except Exception as e:
+            err = str(e).lower()
+            # aioslsk a veces queda con un _slsk_client cacheado en estado
+            # roto (listening port no abre la primera vez post-boot, o el
+            # cliente se desconecto sin invalidar el cache). Force-relogin
+            # reinstancia el cliente y casi siempre lo desbloquea.
+            if "listening port" in err or "no valid session" in err or "connection" in err:
+                log.warning("[slsk-search] exc=%s — force relogin and retry", str(e)[:120])
+                await get_slsk_client(username, password, force_relogin=True)
+                results = await _run_slsk_search(username, password, query, search_wait=wait_s)
+            else:
+                raise
         # Si vino 0 resultados, la session pudo haber expirado silenciosamente
         # (aioslsk: "WARNING: not returning search results: no valid session").
         # Retry UNA vez forzando re-login del SoulSeek client.
