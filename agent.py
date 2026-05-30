@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.3"
+VERSION = "2.12.4"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -2086,26 +2086,32 @@ rm -f "$0"
                     current_exe = Path(sys.executable) if not hasattr(sys, '_MEIPASS') else Path(sys.argv[0]).resolve()
                     if getattr(sys, 'frozen', False) or str(current_exe).endswith('.exe'):
                         bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
-                        # Timeout 5s da margen para que este proceso muera
-                        # (via os._exit programado abajo) y libere el file
-                        # lock antes que el bat intente el copy. Antes eran
-                        # 2s y el copy fallaba porque el .exe seguia locked.
+                        # Rename-trick: en Windows podes RENOMBRAR un .exe en
+                        # uso aunque no podes sobreescribirlo. Por eso el bat
+                        # primero mueve el actual a .old (libera el nombre),
+                        # despues copia el nuevo, y arranca. El viejo .exe
+                        # sigue corriendo desde su .old y muere cuando ya no
+                        # lo necesita nadie. Sin esto el copy fallaba por
+                        # file lock y el update no entraba nunca.
+                        old_exe = current_exe.with_suffix('.exe.old')
                         bat.write_text(f"""@echo off
-timeout /t 5 /nobreak >nul
+timeout /t 2 /nobreak >nul
+del /F /Q "{old_exe}" 2>nul
+move /Y "{current_exe}" "{old_exe}"
 copy /Y "{tmp_path}" "{current_exe}"
 start "" "{current_exe}"
 del "%~f0"
 """, encoding="utf-8")
                         update_msg = f"Actualizando a v{latest}..."
-                        log.info("Launching update+restart bat...")
+                        log.info("Launching update+restart bat (rename-trick)...")
                         subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
-                        # Programar el suicidio del proceso. Necesario para
-                        # que el .exe deje de tener file lock antes que el
-                        # bat haga el copy. Sin esto el update siempre
-                        # fallaba silencioso.
+                        # Self-kill defensivo: aunque el rename-trick
+                        # permite que el viejo siga vivo, conviene matar
+                        # este proceso despues que la response salio para
+                        # liberar el puerto 9900 antes que arranque el nuevo.
                         async def _selfkill():
-                            await asyncio.sleep(2.0)
-                            log.info("Self-killing to release file lock on .exe")
+                            await asyncio.sleep(3.0)
+                            log.info("Self-exiting so new exe can bind port %d", PORT)
                             os._exit(0)
                         asyncio.create_task(_selfkill())
                     else:
