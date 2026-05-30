@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.2"
+VERSION = "2.12.3"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -2086,8 +2086,12 @@ rm -f "$0"
                     current_exe = Path(sys.executable) if not hasattr(sys, '_MEIPASS') else Path(sys.argv[0]).resolve()
                     if getattr(sys, 'frozen', False) or str(current_exe).endswith('.exe'):
                         bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
+                        # Timeout 5s da margen para que este proceso muera
+                        # (via os._exit programado abajo) y libere el file
+                        # lock antes que el bat intente el copy. Antes eran
+                        # 2s y el copy fallaba porque el .exe seguia locked.
                         bat.write_text(f"""@echo off
-timeout /t 2 /nobreak >nul
+timeout /t 5 /nobreak >nul
 copy /Y "{tmp_path}" "{current_exe}"
 start "" "{current_exe}"
 del "%~f0"
@@ -2095,6 +2099,15 @@ del "%~f0"
                         update_msg = f"Actualizando a v{latest}..."
                         log.info("Launching update+restart bat...")
                         subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
+                        # Programar el suicidio del proceso. Necesario para
+                        # que el .exe deje de tener file lock antes que el
+                        # bat haga el copy. Sin esto el update siempre
+                        # fallaba silencioso.
+                        async def _selfkill():
+                            await asyncio.sleep(2.0)
+                            log.info("Self-killing to release file lock on .exe")
+                            os._exit(0)
+                        asyncio.create_task(_selfkill())
                     else:
                         update_msg = f"v{latest} disponible (solo .exe compilado)"
                 else:
