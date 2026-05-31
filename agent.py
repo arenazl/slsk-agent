@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.4"
+VERSION = "2.12.5"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
