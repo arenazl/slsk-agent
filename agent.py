@@ -441,6 +441,9 @@ async def get_slsk_client(username: str, password: str, force_relogin: bool = Fa
             },
         )
         client = SoulSeekClient(settings)
+        async def dummy_connect_ports():
+            pass
+        client.network.connect_listening_ports = dummy_connect_ports
         await client.start()
         await client.login()
         _slsk_client = client
@@ -2169,13 +2172,13 @@ async def handle_options(request: web.Request):
 
 @web.middleware
 async def logging_middleware(request, handler):
-    log.info("→ %s %s (from %s)", request.method, request.path, request.headers.get("Origin", "direct"))
+    log.info("-> %s %s (from %s)", request.method, request.path, request.headers.get("Origin", "direct"))
     try:
         response = await handler(request)
-        log.info("← %s %s → %s", request.method, request.path, response.status)
+        log.info("<- %s %s -> %s", request.method, request.path, response.status)
         return response
     except Exception as e:
-        log.error("← %s %s → ERROR: %s", request.method, request.path, e)
+        log.error("<- %s %s -> ERROR: %s", request.method, request.path, e)
         raise
 
 
@@ -2335,10 +2338,11 @@ def _open_path(path):
 def _reveal_path(path):
     """Open the OS file manager with `path` selected/highlighted."""
     if sys.platform == "win32":
-        # `explorer /select,"C:\path\to\file.flac"` opens the parent folder
-        # with the file pre-selected. Pass as a single string because
-        # explorer.exe parses /select, with comma-as-delimiter literally.
-        subprocess.Popen(f'explorer /select,"{path}"')
+        # explorer /select,FULLPATH abre la carpeta con el file marcado.
+        # Pasamos como LISTA: si pasabamos string y el filename tenia & o
+        # caracteres reservados de cmd, se truncaba el comando y abria nada.
+        # Con lista Windows Popen escapa los argumentos correctamente.
+        subprocess.Popen(["explorer", f"/select,{path}"])
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-R", path])
     else:
