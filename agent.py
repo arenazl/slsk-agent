@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.6"
+VERSION = "2.12.7"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -51,7 +51,10 @@ ALLOWED_ORIGINS = [
 ]
 # Allow any *.djfreeapp.ar / *.netlify.app subdomain too
 ALLOWED_ORIGIN_SUFFIXES = (".djfreeapp.ar", ".netlify.app")
-SERVER_URL = "https://slsk-backend-7da97b8a965d.herokuapp.com"
+# Backend hub. Default: Cloud Run (São Paulo). Override con AGENT_SERVER_URL
+# si alguna vez hay que reapuntar sin recompilar el .exe (lección de la
+# migración Heroku→GCP: nunca más quemar la URL sola en el binario).
+SERVER_URL = os.environ.get("AGENT_SERVER_URL", "https://djfreeapp-api-730989854717.southamerica-east1.run.app")
 AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".wav", ".aif", ".aiff",
     ".m4a", ".ogg", ".aac", ".wma", ".opus",
