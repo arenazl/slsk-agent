@@ -53,7 +53,7 @@ ALLOWED_ORIGINS = [
 ALLOWED_ORIGIN_SUFFIXES = (".djfreeapp.ar", ".netlify.app")
 # Backend hub. Default: Cloud Run (São Paulo). Override con AGENT_SERVER_URL
 # si alguna vez hay que reapuntar sin recompilar el .exe (lección de la
-# migración Heroku→GCP: nunca más quemar la URL sola en el binario).
+# migración Cloud Run→GCP: nunca más quemar la URL sola en el binario).
 SERVER_URL = os.environ.get("AGENT_SERVER_URL", "https://djfreeapp-api-730989854717.southamerica-east1.run.app")
 AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".wav", ".aif", ".aiff",
@@ -457,7 +457,7 @@ async def get_slsk_client(username: str, password: str, force_relogin: bool = Fa
 
 
 async def _report_progress(callback_url: str, payload: dict):
-    """POST progress to Heroku so it broadcasts to UI via WS."""
+    """POST progress to Cloud Run so it broadcasts to UI via WS."""
     if not callback_url:
         return
     try:
@@ -473,7 +473,7 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
     """Background task: try each source with fail-fast; report progress."""
     async def report(status, **kw):
         # via="agent" — la UI se entera que el archivo ya está en disco local
-        # y no intenta hacer fetch a Heroku /audio (que daría 404).
+        # y no intenta hacer fetch a Cloud Run /audio (que daría 404).
         await _report_progress(callback_url, {"filename": filename, "status": status, "via": "agent", **kw})
 
     folder = get_download_folder()
@@ -627,7 +627,7 @@ def _build_search_ladder(query: str) -> list:
 async def _run_slsk_search(username: str, password: str, query: str, search_wait: int = 20):
     """Search SoulSeek for `query` and return a list of audio candidates.
     Replica simplificada de _search_soulseek_impl del server, pero corre
-    en la red local del usuario → ve peers normales que Heroku no alcanza."""
+    en la red local del usuario → ve peers normales que Cloud Run no alcanza."""
     client = await get_slsk_client(username, password)
 
     _stopw = {"mix", "the", "and", "ext", "original", "feat", "featuring",
@@ -780,7 +780,7 @@ async def _run_slsk_search(username: str, password: str, query: str, search_wait
 
 
 async def handle_slsk_search(request: web.Request):
-    """Search SoulSeek via the local agent (sees peers Heroku NAT can't reach).
+    """Search SoulSeek via the local agent (sees peers Cloud Run NAT can't reach).
     Body: {username, password, query, wait?:20}. Returns {ok, results:[...]}.
     Synchronous — UI awaits the full result list."""
     if not AIOSLSK_AVAILABLE:
@@ -836,7 +836,7 @@ async def handle_slsk_search(request: web.Request):
 async def handle_slsk_download(request: web.Request):
     """Delegated download entry point. Body: {username, password, filename,
     sources:[{username,remote_path,queue,free_slots,speed}], callback_url}.
-    Returns immediately; progress streams to callback_url on Heroku."""
+    Returns immediately; progress streams to callback_url on Cloud Run."""
     if not AIOSLSK_AVAILABLE:
         return web.json_response(
             {"ok": False, "error": "aioslsk not installed on agent"},
@@ -886,7 +886,7 @@ async def handle_status(request: web.Request):
 
 
 # ─── WS reverse tunnel (cliente) ─────────────────────────
-# Mantiene una conexion WS saliente al server (Heroku) por la cual el
+# Mantiene una conexion WS saliente al server (Cloud Run) por la cual el
 # server le manda HTTP requests que el agente ejecuta localmente y
 # devuelve por el mismo canal. Sin Tailscale, sin puerto abierto.
 _tunnel_task = None              # asyncio.Task | None
@@ -934,7 +934,7 @@ async def _tunnel_dispatch(data: dict) -> dict:
 
 
 async def _tunnel_loop(username: str):
-    """Conecta WS a Heroku y queda escuchando. Reconnect con backoff."""
+    """Conecta WS a Cloud Run y queda escuchando. Reconnect con backoff."""
     global _tunnel_connected
     import aiohttp
     ws_url = SERVER_URL.replace("https://", "wss://").replace("http://", "ws://")
@@ -1194,7 +1194,7 @@ async def handle_config(request: web.Request):
 
 
 async def handle_rate(request: web.Request):
-    """Deprecated: ratings now go to Heroku/Cloudinary. Kept for backwards compat."""
+    """Deprecated: ratings now go to Cloud Run/Cloudinary. Kept for backwards compat."""
     return web.json_response({"ok": True, "deprecated": True})
 
 
