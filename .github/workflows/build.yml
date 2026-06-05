@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install nuitka pystray pillow aiohttp aioslsk cloudinary ordered-set zstandard
+        run: pip install nuitka pystray pillow aiohttp aioslsk cloudinary ordered-set zstandard selenium webdriver-manager
       - name: Cache Nuitka
         uses: actions/cache@v4
         with:
