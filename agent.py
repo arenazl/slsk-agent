@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.7"
+VERSION = "2.12.8"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -469,6 +469,120 @@ async def _report_progress(callback_url: str, payload: dict):
         log.debug("progress callback failed: %s", e)
 
 
+def _write_tags(filepath, genre=None, artist=None, title=None, bpm=None, key=None):
+    """Escribe tags en el archivo (mutagen). Solo escribe los campos provistos.
+    Soporta FLAC/MP3/AIFF/WAV/M4A/OGG. Best-effort (no rompe si falla)."""
+    try:
+        from mutagen.flac import FLAC
+        from mutagen.easyid3 import EasyID3
+        from mutagen.aiff import AIFF
+        from mutagen.wave import WAVE
+        from mutagen.mp4 import MP4
+        from mutagen.oggvorbis import OggVorbis
+        from mutagen.id3 import TIT2, TPE1, TCON, TBPM, TKEY, ID3, error as ID3Error
+    except Exception as e:
+        log.warning("mutagen no disponible: %s", e)
+        return False
+    ext = Path(filepath).suffix.lower()
+    bpm_s = None
+    try:
+        if bpm:
+            bpm_s = str(int(round(float(bpm))))
+    except Exception:
+        bpm_s = None
+    try:
+        if ext in (".flac", ".ogg"):
+            a = FLAC(str(filepath)) if ext == ".flac" else OggVorbis(str(filepath))
+            if artist: a["artist"] = artist
+            if title: a["title"] = title
+            if genre: a["genre"] = genre
+            if bpm_s: a["bpm"] = bpm_s
+            if key: a["initialkey"] = key; a["key"] = key
+            a.save()
+        elif ext == ".mp3":
+            try:
+                a = EasyID3(str(filepath))
+            except ID3Error:
+                a = EasyID3(); a.save(str(filepath)); a = EasyID3(str(filepath))
+            if artist: a["artist"] = artist
+            if title: a["title"] = title
+            if genre: a["genre"] = genre
+            if bpm_s: a["bpm"] = bpm_s
+            a.save()
+            if key:
+                t = ID3(str(filepath)); t.setall("TKEY", [TKEY(encoding=3, text=key)]); t.save()
+        elif ext in (".aiff", ".aif", ".wav"):
+            a = (WAVE if ext == ".wav" else AIFF)(str(filepath))
+            if a.tags is None:
+                a.add_tags()
+            if artist: a.tags.setall("TPE1", [TPE1(encoding=3, text=artist)])
+            if title: a.tags.setall("TIT2", [TIT2(encoding=3, text=title)])
+            if genre: a.tags.setall("TCON", [TCON(encoding=3, text=genre)])
+            if bpm_s: a.tags.setall("TBPM", [TBPM(encoding=3, text=bpm_s)])
+            if key: a.tags.setall("TKEY", [TKEY(encoding=3, text=key)])
+            a.save()
+        elif ext in (".m4a", ".aac"):
+            a = MP4(str(filepath))
+            if artist: a["\xa9ART"] = artist
+            if title: a["\xa9nam"] = title
+            if genre: a["\xa9gen"] = genre
+            if bpm_s: a["tmpo"] = [int(bpm_s)]
+            a.save()
+        return True
+    except Exception as e:
+        log.warning("write tags fail %s: %s", filepath, e)
+        return False
+
+
+async def _curate_downloaded(folder, filename):
+    """Tras bajar un tema: pide al server la metadata curada (Beatport + IA),
+    escribe los tags y mueve el archivo a su carpeta de genero. Best-effort —
+    si algo falla, el archivo queda bajado igual (sin curar)."""
+    try:
+        src = Path(folder) / filename
+        if not src.exists():
+            found = _find_file_in_library(filename)
+            if not found:
+                return
+            src = found
+        meta = None
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                async with s.post(f"{SERVER_URL}/api/curate-track",
+                                  json={"filename": filename},
+                                  timeout=aiohttp.ClientTimeout(total=45)) as r:
+                    if r.status == 200:
+                        meta = await r.json()
+        except Exception as e:
+            log.debug("curate request fail: %s", e)
+        if not meta or meta.get("error"):
+            return
+        genre = (meta.get("genre") or "").strip()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _write_tags, str(src), genre,
+                                   meta.get("artist"), meta.get("title"),
+                                   meta.get("bpm"), meta.get("key"))
+        if genre:
+            dest_dir = Path(folder) / genre
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / src.name
+            try:
+                same = src.resolve() == dest.resolve()
+            except Exception:
+                same = (str(src) == str(dest))
+            if not same and not dest.exists():
+                shutil.move(str(src), str(dest))
+                old = src.parent
+                if old != Path(folder) and old.exists() and not any(old.iterdir()):
+                    try: old.rmdir()
+                    except Exception: pass
+        log.info("Curated %s -> genre=%s bpm=%s key=%s (src=%s)",
+                 filename, genre, meta.get("bpm"), meta.get("key"), meta.get("source"))
+    except Exception as e:
+        log.warning("curate_downloaded fail: %s", e)
+
+
 async def _run_slsk_download(username, password, sources, filename, callback_url):
     """Background task: try each source with fail-fast; report progress."""
     async def report(status, **kw):
@@ -561,6 +675,14 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
             # check the file actually landed in local storage.
             local_name = remote_path.rsplit("\\", 1)[-1] if "\\" in remote_path else remote_path.rsplit("/", 1)[-1]
             await report("completed", source=peer, local_name=local_name)
+            # Curación automática: tags (Beatport+IA via server) + ubicar en
+            # carpeta de género. En background para no demorar el "completed".
+            try:
+                folder = get_download_folder()
+                if folder:
+                    asyncio.create_task(_curate_downloaded(folder, local_name))
+            except Exception:
+                pass
             return
 
     await report("error", message="no sources succeeded")
@@ -1118,6 +1240,14 @@ async def handle_move_file(request: web.Request):
         old_parent = src.parent
         if old_parent != Path(folder) and not any(old_parent.iterdir()):
             old_parent.rmdir()
+
+    # Drag manual = recategorizar: grabar el tag de genero = carpeta destino,
+    # asi Rekordbox lo lee. (genre vacio = volver a la raiz, no tocamos el tag.)
+    if genre:
+        try:
+            _write_tags(str(dest), genre=genre)
+        except Exception as e:
+            log.debug("move-file genre tag fail: %s", e)
 
     return web.json_response({"ok": True})
 

@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install nuitka pystray pillow aiohttp aioslsk cloudinary ordered-set zstandard selenium webdriver-manager
+        run: pip install nuitka pystray pillow aiohttp aioslsk cloudinary ordered-set zstandard selenium webdriver-manager mutagen
       - name: Cache Nuitka
         uses: actions/cache@v4
         with:
@@ -73,7 +73,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install pyinstaller rumps pystray pillow aiohttp aioslsk cloudinary selenium webdriver-manager
+        run: pip install pyinstaller rumps pystray pillow aiohttp aioslsk cloudinary selenium webdriver-manager mutagen
       - name: Create menubar icon
         run: |
           python -c "
