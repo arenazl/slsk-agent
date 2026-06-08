@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.8"
+VERSION = "2.12.9"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -1350,6 +1350,16 @@ async def handle_delete(request: web.Request):
     return web.json_response({"ok": True})
 
 
+def _trash_file(path):
+    """Manda el archivo a la Papelera de Windows (reversible). Fallback a borrado
+    definitivo solo si send2trash no esta disponible."""
+    try:
+        from send2trash import send2trash as _s2t
+        _s2t(str(path))
+    except Exception:
+        Path(path).unlink()
+
+
 async def handle_delete_dupes(request: web.Request):
     body = await request.json()
     filenames = body.get("filenames", [])
@@ -1366,10 +1376,10 @@ async def handle_delete_dupes(request: web.Request):
         if filepath and filepath.exists():
             try:
                 parent = filepath.parent
-                filepath.unlink()
+                _trash_file(filepath)
                 deleted_count += 1
                 deleted_files.append(fname)
-                log.info("Deleted dupe: %s", filepath)
+                log.info("Trashed dupe: %s", filepath)
                 # Clean up empty directory
                 if parent != download_dir and not any(parent.iterdir()):
                     parent.rmdir()
@@ -2770,6 +2780,134 @@ def _on_exit(icon, item):
     os._exit(0)
 
 
+# ---------------------------------------------------------------------------
+# Tray resilience — re-assert the icon when explorer.exe restarts
+# ---------------------------------------------------------------------------
+# pystray's own WM_TASKBARCREATED handler re-shows the icon on a *single*,
+# clean explorer restart, but it's a one-shot broadcast with no retry. Under a
+# burst of explorer crashes/restarts (observed 2026-06-07: 4 restarts in ~13
+# min) the message is missed and the icon vanishes while the agent keeps
+# running headless. This watchdog polls explorer's PID set and re-asserts the
+# icon whenever explorer was fully replaced — independent of the broadcast.
+
+def _explorer_pids() -> set:
+    """Return the set of explorer.exe PIDs. Empty set on non-Windows or error."""
+    if sys.platform != "win32":
+        return set()
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    pids: set = set()
+    # restype/argtypes are mandatory on x64: a HANDLE is 64-bit and ctypes
+    # defaults to c_int (32-bit), which truncates the handle and corrupts
+    # CloseHandle / the invalid-handle check.
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32FirstW.restype = wintypes.BOOL
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.restype = wintypes.BOOL
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    INVALID = ctypes.c_void_p(-1).value  # INVALID_HANDLE_VALUE, platform-correct
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID:
+        return pids
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if (entry.szExeFile or "").lower() == "explorer.exe":
+                pids.add(int(entry.th32ProcessID))
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return pids
+
+
+def _reassert_tray_icon(icon):
+    """Ask pystray to re-add the icon, ON ITS OWN message-loop thread.
+
+    We must NOT mutate icon.visible from the watchdog thread: pystray's Win32
+    backend reads/writes icon._visible from its message loop with no lock, so a
+    cross-thread toggle races (duplicate NIM_ADD / lost re-assert). Instead we
+    PostMessage the very same WM_TASKBARCREATED that Windows broadcasts on a real
+    taskbar rebuild; pystray's _on_taskbarcreated handler then re-shows the icon
+    in the correct thread. Idempotent and flicker-free (no hide/show toggle).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        hwnd = getattr(icon, "_hwnd", None)
+        if not hwnd:
+            return  # message window not created yet (icon.run() hasn't started)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.RegisterWindowMessageW.restype = wintypes.UINT
+        user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+        # argtypes are mandatory: HWND is 64-bit on x64, default c_int truncates.
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        # "TaskbarCreated" is a registered message — same value process-wide.
+        msg = user32.RegisterWindowMessageW("TaskbarCreated")
+        if msg:
+            user32.PostMessageW(wintypes.HWND(int(hwnd)), msg, 0, 0)
+            log.info("Tray icon re-assert posted (WM_TASKBARCREATED)")
+    except Exception:
+        log.exception("Failed to re-assert tray icon")
+
+
+def _tray_watchdog(icon):
+    """Daemon loop: re-assert the tray icon when explorer's shell is rebuilt.
+
+    Fires on (a) any newly-appeared explorer PID, or (b) explorer having fully
+    vanished and come back (covers PID recycling within a poll window). The
+    re-assert is idempotent and invisible, so being slightly liberal here is
+    safe — a redundant post is a no-op, a missed one leaves the icon gone.
+    """
+    if sys.platform != "win32":
+        return
+    last = _explorer_pids()
+    explorer_was_down = False
+    while True:
+        time.sleep(5)
+        try:
+            cur = _explorer_pids()
+            if not cur:
+                # explorer is gone right now (mid-restart) — remember and wait
+                explorer_was_down = True
+                continue
+            appeared = cur - last
+            if appeared or explorer_was_down:
+                log.info("explorer change detected (pids %s -> %s, was_down=%s)",
+                         last, cur, explorer_was_down)
+                _reassert_tray_icon(icon)
+            explorer_was_down = False
+            last = cur
+        except Exception as e:
+            log.debug("tray watchdog error: %s", e)
+
+
 def run_tray(ready_event: threading.Event):
     """Run the pystray icon (Windows/Linux only)."""
     icon = pystray.Icon(
@@ -2789,6 +2927,9 @@ def run_tray(ready_event: threading.Event):
             pystray.MenuItem("Salir", _on_exit),
         ),
     )
+    # Watchdog re-asserts the icon if explorer restarts (pystray's broadcast
+    # handler alone is unreliable under rapid explorer crashes).
+    threading.Thread(target=_tray_watchdog, args=(icon,), daemon=True).start()
     ready_event.set()
     icon.run()
 
@@ -3017,8 +3158,70 @@ def _run_server_in_thread():
         loop.close()
 
 
+# ---------------------------------------------------------------------------
+# Single-instance guard
+# ---------------------------------------------------------------------------
+# Without this, double-clicking the .exe while one is already running spawned a
+# second process that died ~22 ms later on the port-9900 bind — silently ("lo
+# corro y no pasa nada"). A named mutex lets us detect the running instance up
+# front and tell the user where to look instead of failing quietly.
+
+_singleton_handle = None  # keep the mutex handle alive for the process lifetime
+
+
+def _acquire_single_instance() -> bool:
+    """Return True if this is the only instance. Windows-only (named mutex);
+    other platforms always return True (the port bind still guards there)."""
+    global _singleton_handle
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    from ctypes import wintypes
+    ERROR_ALREADY_EXISTS = 183
+    # use_last_error + ctypes.get_last_error() is the reliable way to read the
+    # error of the *last* foreign call; windll.kernel32.GetLastError() makes an
+    # extra call that can clobber it. restype=HANDLE avoids 64-bit truncation.
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    # Session-local name (no "Global\\") => one instance per logged-in user.
+    handle = k32.CreateMutexW(None, False, "GrooveSyncAgent_singleton")
+    err = ctypes.get_last_error()
+    if not handle:
+        # Couldn't create the mutex — fail open so we never block a real launch.
+        return True
+    if err == ERROR_ALREADY_EXISTS:
+        return False
+    _singleton_handle = handle
+    return True
+
+
+def _warn_already_running():
+    """Tell the user an instance is live and where its tray icon hides."""
+    log.info("Another instance is already running — exiting this one")
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "DJ Free App ya esta corriendo.\n\n"
+                "Busca el icono 'G' en la bandeja del sistema "
+                "(la flecha ^ junto al reloj).",
+                "DJ Free App Agent",
+                0x40,  # MB_ICONINFORMATION
+            )
+        except Exception:
+            pass
+
+
 def main():
     log.info("=== DJ Free App Agent v%s starting ===", VERSION)
+
+    # Single-instance guard: bail out *before* the folder picker / port bind so
+    # a duplicate launch reports clearly instead of dying silently.
+    if not _acquire_single_instance():
+        _warn_already_running()
+        return
 
     # First run setup (folder picker)
     first_run_setup()
