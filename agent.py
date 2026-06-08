@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.9"
+VERSION = "2.12.10"
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -512,7 +512,16 @@ def _write_tags(filepath, genre=None, artist=None, title=None, bpm=None, key=Non
             if key:
                 t = ID3(str(filepath)); t.setall("TKEY", [TKEY(encoding=3, text=key)]); t.save()
         elif ext in (".aiff", ".aif", ".wav"):
-            a = (WAVE if ext == ".wav" else AIFF)(str(filepath))
+            # Algunos .aif son en realidad WAV (root chunk RIFF) o viceversa; probamos
+            # el contenedor que corresponde por extensión y caemos al otro si falla.
+            a = None
+            for C in ([WAVE, AIFF] if ext == ".wav" else [AIFF, WAVE]):
+                try:
+                    a = C(str(filepath)); break
+                except Exception:
+                    a = None
+            if a is None:
+                return False
             if a.tags is None:
                 a.add_tags()
             if artist: a.tags.setall("TPE1", [TPE1(encoding=3, text=artist)])
@@ -1387,6 +1396,140 @@ async def handle_delete_dupes(request: web.Request):
                 log.error("Error deleting %s: %s", fname, e)
 
     return web.json_response({"ok": True, "deleted": deleted_count, "files": deleted_files})
+
+
+async def handle_write_tags(request: web.Request):
+    """Reescribe los tags fisicos (mutagen) de archivos existentes — para que la
+    curacion de metadata llegue al archivo y Rekordbox la lea.
+    Body {files: [{filename, artist?, title?, genre?, key?, bpm?}]}."""
+    body = await request.json()
+    items = body.get("files", []) or []
+    written = 0
+    for it in items:
+        fn = it.get("filename")
+        if not fn:
+            continue
+        fp = _find_file_in_library(fn)
+        if not fp or not fp.exists():
+            continue
+        try:
+            _write_tags(str(fp), genre=it.get("genre"), artist=it.get("artist"),
+                        title=it.get("title"), bpm=it.get("bpm"), key=it.get("key"))
+            written += 1
+        except Exception as e:
+            log.error("write-tags %s: %s", fn, e)
+    return web.json_response({"ok": True, "written": written})
+
+
+def _meta_is_dirty(info):
+    a = (info.get("artist") or "").strip()
+    t = (info.get("title") or "").strip()
+    return (not a) or (not t) or ("_" in t) or len(t) > 70 or bool(re.match(r"^\s*\d{1,3}[\.\-_ ]", t))
+
+
+async def handle_fix_metadata(request: web.Request):
+    """Arregla los metatags de la biblioteca y los baja al ARCHIVO físico (para que
+    Rekordbox los lea). Pasos:
+      1) baja el manifest curado (Cloudinary, via server),
+      2) para cada archivo con artista vacío o título sucio: lo cura con
+         /api/curate-track (Beatport+IA) SIN pisar el género ya asignado,
+      3) escribe los tags DENTRO del archivo con mutagen (artista/título/género/key/bpm),
+      4) sube el manifest si cambió.
+    Body {username?}. Devuelve {fixed_meta, tags_written, total, errors}."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    folder = get_download_folder()
+    if not folder:
+        return web.json_response({"ok": False, "error": "No folder configured"}, status=400)
+    username = (body.get("username") or load_config().get("username") or "").strip()
+
+    import aiohttp
+    # 1) manifest curado desde el server
+    manifest = {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{SERVER_URL}/api/metadata", params={"user": username},
+                             timeout=aiohttp.ClientTimeout(total=40)) as r:
+                if r.status == 200:
+                    manifest = await r.json()
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"manifest: {e}"}, status=502)
+    if not isinstance(manifest, dict):
+        manifest = {}
+
+    root = Path(folder)
+    files = []
+    for p in root.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in AUDIO_EXTENSIONS or p.name == "manifest.json":
+            continue
+        rel = p.relative_to(root)
+        top = rel.parts[0] if len(rel.parts) > 1 else ""
+        if top.lower() in IGNORE_DIRS:
+            continue
+        files.append(p)
+
+    fixed_meta = 0
+    tags_written = 0
+    errors = 0
+    changed = False
+    loop = asyncio.get_event_loop()
+
+    async with aiohttp.ClientSession() as s:
+        for p in files:
+            info = dict(manifest.get(p.name, {}) or {})
+            # 2) curar si está incompleto (sin pisar género)
+            if _meta_is_dirty(info):
+                meta = None
+                try:
+                    async with s.post(f"{SERVER_URL}/api/curate-track",
+                                      json={"artist": info.get("artist", ""), "title": info.get("title", ""), "filename": p.name},
+                                      timeout=aiohttp.ClientTimeout(total=45)) as r:
+                        if r.status == 200:
+                            meta = await r.json()
+                except Exception:
+                    meta = None
+                if meta and not meta.get("error"):
+                    cur_t = info.get("title") or ""
+                    title_dirty = (not cur_t.strip()) or ("_" in cur_t) or len(cur_t) > 70
+                    if not (info.get("artist") or "").strip() and meta.get("artist"):
+                        info["artist"] = meta["artist"]; changed = True
+                    if title_dirty and meta.get("title"):
+                        info["title"] = meta["title"]; changed = True
+                    if not (info.get("key") or "").strip() and meta.get("key"):
+                        info["key"] = meta["key"]; changed = True
+                    if not info.get("bpm") and meta.get("bpm"):
+                        info["bpm"] = meta["bpm"]; changed = True
+                    if not (info.get("genre") or "").strip() and meta.get("genre"):
+                        info["genre"] = meta["genre"]; changed = True
+                    manifest[p.name] = info
+                    fixed_meta += 1
+            # 3) escribir los tags DENTRO del archivo (con los valores del manifest)
+            if info.get("artist") or info.get("title") or info.get("genre") or info.get("key"):
+                ok = await loop.run_in_executor(
+                    None, _write_tags, str(p), info.get("genre"), info.get("artist"),
+                    info.get("title"), info.get("bpm"), info.get("key"))
+                if ok:
+                    tags_written += 1
+                else:
+                    errors += 1
+
+    # 4) subir manifest si cambió
+    if changed:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(f"{SERVER_URL}/api/sync-manifest",
+                                  json={"manifest": manifest, "username": username},
+                                  timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    await r.read()
+        except Exception as e:
+            log.warning("fix-metadata sync-manifest fail: %s", e)
+
+    log.info("fix-metadata: %s curados, %s tags escritos, %s errores (de %s)",
+             fixed_meta, tags_written, errors, len(files))
+    return web.json_response({"ok": True, "fixed_meta": fixed_meta, "tags_written": tags_written,
+                              "total": len(files), "errors": errors})
 
 
 _ILLEGAL_WIN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -2361,6 +2504,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/rate", handle_rate)
     app.router.add_post("/api/delete", handle_delete)
     app.router.add_post("/api/delete-dupes", handle_delete_dupes)
+    app.router.add_post("/api/write-tags", handle_write_tags)
+    app.router.add_post("/api/fix-metadata", handle_fix_metadata)
     app.router.add_post("/api/organize", handle_organize)
     app.router.add_get("/api/open-folder", handle_open_folder)
     app.router.add_get("/api/audio/{path:.+}", handle_audio)
