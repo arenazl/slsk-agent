@@ -37,7 +37,13 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.10"
+VERSION = "2.12.11"
+
+
+def _ver_tuple(v):
+    """Versión como tupla de enteros para comparar bien ('2.12.10' > '2.12.8').
+    Comparar como string fallaba en el cruce de 1->2 dígitos (.9 vs .10)."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
 PORT = 9900
 HOST = "127.0.0.1"  # local-only; prevents LAN exposure (was 0.0.0.0 pre-2.10.0)
 ALLOWED_ORIGINS = [
@@ -1633,6 +1639,105 @@ def _cors_headers(request):
     return h
 
 
+# Reproduccion rapida: los WAV/AIFF/FLAC grandes (sin comprimir o pesados) el
+# navegador los buferea/decodifica casi enteros antes de arrancar -> 5-10s de
+# espera aunque el archivo este local. Para escuchar en la app los
+# transcodificamos al vuelo a MP3 192k (stream): arranca al toque (~130ms) y
+# pesa ~12x menos. El archivo original NUNCA se toca (queda lossless en disco
+# para Rekordbox/mezclar). Solo afecta la previsualizacion en la app.
+_TRANSCODE_BITRATE = 192                          # kbps (CBR)
+_TRANSCODE_BPS = _TRANSCODE_BITRATE * 1000 // 8   # bytes/seg (24000) para mapear byte<->tiempo
+
+
+def _probe_duration(path) -> float:
+    """Duracion en segundos via ffprobe (0.0 si falla)."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0.0
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        return float(out or 0)
+    except Exception:
+        return 0.0
+
+
+async def _stream_transcoded(request: web.Request, target: Path, cors: dict):
+    """Transcodifica al vuelo a MP3 192k para arranque instantaneo.
+    Seek aproximado via Range: con CBR, byte_offset / _TRANSCODE_BPS = segundos,
+    asi mapeamos el Range del navegador a un -ss de ffmpeg. Devuelve None si no
+    hay ffmpeg (el caller cae al servido directo)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+
+    duration = _probe_duration(target)
+    total = int(duration * _TRANSCODE_BPS) if duration else 0
+
+    start = 0
+    range_header = request.headers.get("Range", "")
+    m = re.match(r"bytes=(\d+)-", range_header)
+    if m:
+        start = int(m.group(1))
+    start_time = start / _TRANSCODE_BPS if start else 0.0
+
+    cmd = [ffmpeg, "-nostdin", "-v", "error"]
+    if start_time > 0.05:
+        cmd += ["-ss", f"{start_time:.3f}"]
+    cmd += ["-i", str(target), "-vn", "-map", "0:a:0",
+            "-c:a", "libmp3lame", "-b:a", f"{_TRANSCODE_BITRATE}k", "-f", "mp3", "-"]
+
+    headers = {**cors, "Content-Type": "audio/mpeg", "Accept-Ranges": "bytes"}
+    if total:
+        if range_header:
+            end = total - 1
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            headers["Content-Length"] = str(total - start)
+            status = 206
+        else:
+            headers["Content-Length"] = str(total)
+            status = 200
+    else:
+        status = 206 if range_header else 200
+
+    resp = web.StreamResponse(status=status, headers=headers)
+    await resp.prepare(request)
+
+    cap = (total - start) if total else None   # no exceder el Content-Length prometido
+    sent = 0
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        while True:
+            chunk = await proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            if cap is not None:
+                room = cap - sent
+                if room <= 0:
+                    break
+                if len(chunk) > room:
+                    chunk = chunk[:room]
+            await resp.write(chunk)
+            sent += len(chunk)
+    except (ConnectionResetError, ConnectionAbortedError, OSError):
+        pass
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        await resp.write_eof()
+    except (ConnectionResetError, ConnectionAbortedError, OSError):
+        pass
+    return resp
+
+
 async def handle_audio(request: web.Request):
     """Stream an audio file from the library."""
     folder = get_download_folder()
@@ -1658,6 +1763,14 @@ async def handle_audio(request: web.Request):
     ct = content_types.get(target.suffix.lower(), "application/octet-stream")
     file_size = target.stat().st_size
     cors = _cors_headers(request)
+
+    # Reproduccion rapida en la app: transcodificar formatos pesados a MP3 al
+    # vuelo (los .mp3 ya son livianos -> se sirven directo). El original intacto.
+    if request.query.get("fast") == "1" and target.suffix.lower() != ".mp3":
+        transcoded = await _stream_transcoded(request, target, cors)
+        if transcoded is not None:
+            return transcoded
+        # sin ffmpeg: cae al servido directo de abajo
 
     # Support Range requests for seeking
     range_header = request.headers.get("Range", "")
