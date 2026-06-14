@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.11"
+VERSION = "2.12.12"
 
 
 def _ver_tuple(v):
@@ -594,6 +594,25 @@ async def _curate_downloaded(folder, filename):
                     except Exception: pass
         log.info("Curated %s -> genre=%s bpm=%s key=%s (src=%s)",
                  filename, genre, meta.get("bpm"), meta.get("key"), meta.get("source"))
+        # Duracion (ffprobe) -> manifest en CADA descarga, asi no hay que re-correr
+        # el batch. El archivo quedo en su carpeta de genero (o en src si sin genero).
+        try:
+            final = (Path(folder) / genre / src.name) if genre else src
+            if not final.exists():
+                final = _find_file_in_library(filename) or src
+            ffprobe = shutil.which("ffprobe")
+            if ffprobe and final and final.exists():
+                out = await asyncio.get_event_loop().run_in_executor(None, lambda: subprocess.run(
+                    [ffprobe, "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(final)],
+                    capture_output=True, text=True, timeout=20).stdout.strip())
+                if out:
+                    import aiohttp as _ah
+                    async with _ah.ClientSession() as s2:
+                        await s2.post(f"{SERVER_URL}/api/set-duration",
+                                      json={"filename": filename, "duration": round(float(out), 1), "username": _tunnel_user or ""},
+                                      timeout=_ah.ClientTimeout(total=20))
+        except Exception as e:
+            log.debug("set-duration fail: %s", e)
     except Exception as e:
         log.warning("curate_downloaded fail: %s", e)
 
