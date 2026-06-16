@@ -100,7 +100,7 @@ jobs:
           # Imagen RW con espacio de sobra (tamano de la app + 60 MB).
           SIZE=$(du -sm dist/GrooveSyncAgent.app | cut -f1)
           SIZE=$((SIZE + 60))
-          hdiutil create -volname "$VOL" -size ${SIZE}m -fs HFS+ -format UDRW -ov dist/rw.dmg
+          hdiutil create -volname "$VOL" -size ${SIZE}m -fs HFS+ -ov dist/rw.dmg
           # Montar, copiar la app + symlink a /Applications, desmontar (con retry).
           DEV=$(hdiutil attach -readwrite -noverify -noautoopen dist/rw.dmg | egrep '^/dev/' | head -1 | awk '{print $1}')
           cp -R dist/GrooveSyncAgent.app "/Volumes/$VOL/"
