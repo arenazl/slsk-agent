@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.14"
+VERSION = "2.12.15"
 
 
 def _ver_tuple(v):
