@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.12"
+VERSION = "2.12.13"
 
 
 def _ver_tuple(v):
@@ -1650,8 +1650,11 @@ def _cors_headers(request):
     origin = request.headers.get("Origin", "")
     h = {
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, Access-Control-Request-Private-Network",
         "Access-Control-Expose-Headers": "Content-Range, Content-Length",
+        # Private Network Access: Chrome bloquea pedidos a localhost desde paginas HTTPS
+        # salvo que la respuesta lo permita explicitamente (audio del agente).
+        "Access-Control-Allow-Private-Network": "true",
     }
     if origin in ALLOWED_ORIGINS or any(origin.endswith(suf) for suf in ALLOWED_ORIGIN_SUFFIXES):
         h["Access-Control-Allow-Origin"] = origin
