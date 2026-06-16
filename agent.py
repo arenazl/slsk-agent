@@ -37,7 +37,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.13"
+VERSION = "2.12.14"
 
 
 def _ver_tuple(v):
@@ -388,6 +388,11 @@ async def cors_middleware(request: web.Request, handler):
             resp = await handler(request)
         except web.HTTPException as ex:
             resp = ex
+        except Exception as ex:
+            # Sin esto, un error crudo (no-HTTPException) se escapa SIN headers CORS y el
+            # browser lo muestra como "No Access-Control-Allow-Origin", tapando el error real.
+            log.error("[handler error] %s %s: %s", request.method, request.path, ex)
+            resp = web.json_response({"error": str(ex)}, status=500)
 
     if origin in ALLOWED_ORIGINS or any(origin.endswith(suf) for suf in ALLOWED_ORIGIN_SUFFIXES):
         resp.headers["Access-Control-Allow-Origin"] = origin
@@ -1283,7 +1288,22 @@ async def handle_move_file(request: web.Request):
         except Exception as e:
             log.debug("move-file genre tag fail: %s", e)
 
-    return web.json_response({"ok": True})
+    # Actualizar el manifest (género) y sincronizarlo a la NUBE, así la app refleja el
+    # cambio sin re-escanear y la carpeta física + el manifest quedan consistentes.
+    synced = False
+    try:
+        upsert_manifest(filename, {"genre": genre})
+        manifest = load_manifest()
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{SERVER_URL}/api/sync-manifest",
+                              json={"manifest": manifest, "username": _tunnel_user or ""},
+                              timeout=aiohttp.ClientTimeout(total=60)) as r:
+                await r.read()
+                synced = r.status == 200
+    except Exception as e:
+        log.warning("move-file manifest sync fail: %s", e)
+
+    return web.json_response({"ok": True, "synced": synced})
 
 
 async def handle_library(request: web.Request):
