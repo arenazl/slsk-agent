@@ -95,13 +95,24 @@ jobs:
           codesign --force --deep --sign - dist/GrooveSyncAgent.app || true
       - name: Create DMG
         run: |
-          mkdir -p dmg-staging
-          cp -R dist/GrooveSyncAgent.app dmg-staging/
-          ln -s /Applications dmg-staging/Applications
-          hdiutil create -volname "GrooveSyncAgent" \
-            -srcfolder dmg-staging \
-            -ov -format UDZO \
-            dist/GrooveSyncAgent-macOS.dmg
+          set -e
+          VOL="GrooveSyncAgent"
+          # Imagen RW con espacio de sobra (tamano de la app + 60 MB).
+          SIZE=$(du -sm dist/GrooveSyncAgent.app | cut -f1)
+          SIZE=$((SIZE + 60))
+          hdiutil create -volname "$VOL" -size ${SIZE}m -fs HFS+ -format UDRW -ov dist/rw.dmg
+          # Montar, copiar la app + symlink a /Applications, desmontar (con retry).
+          DEV=$(hdiutil attach -readwrite -noverify -noautoopen dist/rw.dmg | egrep '^/dev/' | head -1 | awk '{print $1}')
+          cp -R dist/GrooveSyncAgent.app "/Volumes/$VOL/"
+          ln -s /Applications "/Volumes/$VOL/Applications"
+          sync
+          for i in 1 2 3 4 5; do
+            if hdiutil detach "$DEV"; then break; fi
+            echo "detach busy, retry $i..."; sleep 3
+          done
+          # Convertir a comprimido de solo-lectura (UDZO).
+          hdiutil convert dist/rw.dmg -format UDZO -o dist/GrooveSyncAgent-macOS.dmg
+          rm -f dist/rw.dmg
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
