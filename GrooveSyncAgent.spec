@@ -1,15 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
-import os
-_ui_data = [('ui-dist', 'ui-dist')] if os.path.isdir('ui-dist') else []
-
 a = Analysis(
     ['agent.py'],
     pathex=[],
     binaries=[],
-    datas=[('logo.png', '.'), ('logo_transparent.png', '.'), ('menubar_icon.png', '.')] + _ui_data,
-    hiddenimports=['rumps'],
+    datas=[
+        ('logo.png', '.'),
+        ('icon.ico', '.'),
+        ('logo_transparent.png', '.'),
+        ('menubar_icon.png', '.'),
+    ],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -39,14 +41,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['icon.ico'],
-)
-app = BUNDLE(
-    exe,
-    name='GrooveSyncAgent.app',
-    icon='logo.png',
-    bundle_identifier='com.groovesync.agent',
-    info_plist={
-        'LSUIElement': True,
-        'CFBundleShortVersionString': '2.10.0',
-    },
 )

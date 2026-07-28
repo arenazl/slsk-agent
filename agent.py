@@ -15,6 +15,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
+import urllib.error
 from collections import OrderedDict
 from pathlib import Path
 
@@ -58,9 +60,29 @@ ALLOWED_ORIGINS = [
 # Allow any *.djfreeapp.ar / *.netlify.app subdomain too
 ALLOWED_ORIGIN_SUFFIXES = (".djfreeapp.ar", ".netlify.app")
 # Backend hub. Default: Cloud Run (São Paulo). Override con AGENT_SERVER_URL
-# si alguna vez hay que reapuntar sin recompilar el .exe (lección de la
 # migración Cloud Run→GCP: nunca más quemar la URL sola en el binario).
-SERVER_URL = os.environ.get("AGENT_SERVER_URL", "https://djfreeapp-api-730989854717.southamerica-east1.run.app")
+def _resolve_server_url():
+    # 1. Override via Env Var
+    env_override = os.environ.get("AGENT_SERVER_URL")
+    if env_override:
+        return env_override
+
+    # 2. Override via config.json (in the same dir as the executable)
+    exe_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    local_config = exe_dir / "config.json"
+    if local_config.exists():
+        try:
+            with open(local_config, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("server_url"):
+                    return data["server_url"]
+        except Exception:
+            pass
+
+    # 3. Default Production Cloud Run (us-east4 — región oficial desde 2026-07-28)
+    return "https://djfreeapp-api-730989854717.us-east4.run.app"
+
+SERVER_URL = _resolve_server_url()
 AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".wav", ".aif", ".aiff",
     ".m4a", ".ogg", ".aac", ".wma", ".opus",
@@ -2712,15 +2734,19 @@ async def start_server():
 def _create_tray_icon() -> Image.Image:
     """Load the app logo for the tray icon."""
     size = 64
-    for logo_path in [
-        Path(getattr(sys, '_MEIPASS', '')) / "logo.png",
-        Path(__file__).parent / "logo.png",
-        Path.cwd() / "logo.png",
-    ]:
-        if logo_path.exists():
-            img = Image.open(logo_path).convert("RGBA")
-            img = img.resize((size, size), Image.LANCZOS)
-            return img
+    meipass = Path(getattr(sys, '_MEIPASS', ''))
+    for logo_name in ["logo.png", "logo_transparent.png", "icon.ico", "menubar_icon.png"]:
+        for parent in [meipass, Path(__file__).parent, Path.cwd()]:
+            if not str(parent).strip():
+                continue
+            logo_path = parent / logo_name
+            if logo_path.exists():
+                try:
+                    img = Image.open(logo_path).convert("RGBA")
+                    img = img.resize((size, size), Image.LANCZOS)
+                    return img
+                except Exception:
+                    pass
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([4, 4, size - 4, size - 4], fill=(59, 130, 246, 255))
@@ -3020,33 +3046,29 @@ def _on_configure_folder(icon, item):
         set_download_folder(folder)
         log.info("Folder configured via tray: %s", folder)
 
+def _show_msg(title, text, icon_type=0x40):
+    if sys.platform == "win32":
+        import ctypes
+        threading.Thread(target=lambda: ctypes.windll.user32.MessageBoxW(0, text, title, icon_type), daemon=True).start()
+    else:
+        log.info("[%s] %s", title, text)
 
 def _on_status(icon, item):
     folder = get_download_folder() or "(no configurada)"
-    try:
-        icon.notify(
-            f"Carpeta: {folder}\nPuerto: {PORT}\nVersion: {VERSION}",
-            "DJ Free App Agent",
-        )
-    except Exception:
-        log.info("Status — Folder: %s, Port: %d, Version: %s", folder, PORT, VERSION)
+    msg = f"Carpeta: {folder}\nPuerto: {PORT}\nVersión: {VERSION}\nBackend: {SERVER_URL}"
+    log.info("Status \u2014 Folder: %s, Port: %d, Version: %s, Backend: %s", folder, PORT, VERSION, SERVER_URL)
+    _show_msg("Estado del Agente", msg)
 
 
 def _on_refresh_charts(icon, item):
     log.info("Manual chart refresh requested")
-    try:
-        icon.notify("Renovando charts...", "DJ Free App Agent")
-    except Exception:
-        pass
+    _show_msg("DJ Free App Agent", "Renovando charts...")
     def do_scrape():
         loop = asyncio.new_event_loop()
         try:
             count = loop.run_until_complete(scrape_beatport_charts())
             log.info("Manual scrape done: %d charts", count)
-            try:
-                icon.notify(f"Charts actualizados: {count} géneros", "DJ Free App Agent")
-            except Exception:
-                pass
+            _show_msg("DJ Free App Agent", f"Charts actualizados: {count} géneros")
         except Exception as e:
             log.error("Manual scrape failed: %s", e)
         finally:
@@ -3060,16 +3082,10 @@ def _on_view_logs(icon, item):
 
 def _on_update(icon, item):
     log.info("Checking for updates...")
-    try:
-        icon.notify("Buscando actualizaciones...", "DJ Free App Agent")
-    except Exception:
-        pass
+    _show_msg("DJ Free App Agent", "Buscando actualizaciones...")
     def do():
         def notify_fn(msg):
-            try:
-                icon.notify(msg, "DJ Free App Agent")
-            except Exception:
-                pass
+            _show_msg("DJ Free App Agent", msg)
         _do_check_update(notify_fn)
     threading.Thread(target=do, daemon=True).start()
 
