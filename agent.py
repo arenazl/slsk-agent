@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.18"
+VERSION = "2.12.21"
 
 
 def _ver_tuple(v):
@@ -2882,7 +2882,7 @@ def _do_check_update(notify_fn=None):
             data = json.loads(resp.read().decode())
         latest = (data.get("version", "") or "").lstrip("v")
         current = VERSION
-        if latest <= current:
+        if _ver_tuple(latest) <= _ver_tuple(current):
             log.info("Already up to date: v%s", current)
             notify_fn(f"Ya tenés la última versión (v{current})")
             return
@@ -2953,7 +2953,7 @@ rm -f "$0"
             log.info("Downloaded update to %s", tmp_path)
 
             current_exe = Path(sys.executable)
-            if getattr(sys, 'frozen', False) or sys.executable.endswith('.exe'):
+            if getattr(sys, 'frozen', False):
                 bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
                 bat.write_text(f"""@echo off
 timeout /t 2 /nobreak >nul
@@ -2961,16 +2961,43 @@ copy /Y "{tmp_path}" "{current_exe}"
 start "" "{current_exe}"
 del "%~f0"
 """, encoding="utf-8")
-                log.info("Launching update script, restarting...")
+                log.info("Launching update script for .exe, restarting...")
                 notify_fn(f"Actualizando a v{latest}...")
                 subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
                 os._exit(0)
             else:
-                log.info("Not running as exe, skipping self-update")
-                notify_fn("Actualización solo disponible en .exe")
+                try:
+                    raw_agent_url = "https://raw.githubusercontent.com/arenazl/slsk-agent/master/agent.py"
+                    agent_file = Path(__file__).resolve()
+                    log.info("Downloading raw agent.py update from %s to %s", raw_agent_url, agent_file)
+                    notify_fn(f"Actualizando script agent.py a v{latest}...")
+                    urllib.request.urlretrieve(raw_agent_url, str(agent_file))
+                    log.info("Script agent.py updated successfully to v%s", latest)
+                    notify_fn(f"Agente actualizado a v{latest}. Reiniciando...")
+                    subprocess.Popen([sys.executable, str(agent_file)] + sys.argv[1:])
+                    os._exit(0)
+                except Exception as ex_script:
+                    log.error("Failed updating script agent.py: %s", ex_script)
+                    notify_fn(f"Error al actualizar agent.py: {ex_script}")
     except Exception as e:
         log.error("Update failed: %s", e)
         notify_fn(f"Error al actualizar: {e}")
+
+
+def _start_auto_update_checker():
+    """Background thread that automatically polls for agent updates every 5 minutes."""
+    def _checker():
+        time.sleep(5)
+        while True:
+            try:
+                def _auto_notify(msg):
+                    log.info("[auto-update] %s", msg)
+                    _show_msg("GrooveSync Agent", msg)
+                _do_check_update(notify_fn=_auto_notify)
+            except Exception as e:
+                log.debug("[auto-update] Check failed: %s", e)
+            time.sleep(300)
+    threading.Thread(target=_checker, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
