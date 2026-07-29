@@ -2891,14 +2891,34 @@ def _do_check_update(notify_fn=None):
     if notify_fn is None:
         notify_fn = lambda msg: None
     try:
-        url = "https://djfreeapp.ar/agent/version.json"
-        req = urllib.request.Request(url, headers={"User-Agent": "DJFreeAppAgent"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+        # Check raw GitHub version.json (always up-to-date on master commit)
+        urls_to_try = [
+            "https://raw.githubusercontent.com/arenazl/slsk-ui/master/public/agent/version.json",
+            "https://djfreeapp.ar/agent/version.json",
+        ]
+        data = None
+        for u in urls_to_try:
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "DJFreeAppAgent", "Cache-Control": "no-cache"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                if data and data.get("version"):
+                    break
+            except Exception as ex_u:
+                log.debug("Failed fetching update manifest from %s: %s", u, ex_u)
+                continue
+
+        if not data:
+            log.warning("[update] Failed to fetch version manifest from all sources")
+            notify_fn("No se pudo comprobar la versión en línea")
+            return
+
         latest = (data.get("version", "") or "").lstrip("v")
         current = VERSION
+        log.info("[update-check] local=v%s, remote=v%s", current, latest)
+
         if _ver_tuple(latest) <= _ver_tuple(current):
-            log.info("Already up to date: v%s", current)
+            log.info("[update-check] Already up to date: v%s", current)
             notify_fn(f"Ya tenés la última versión (v{current})")
             return
 
@@ -3005,16 +3025,15 @@ def _start_auto_update_checker():
         time.sleep(5)
         while True:
             try:
+                log.info("[auto-update] Polling for updates (current local=v%s)...", VERSION)
                 def _auto_notify(msg):
                     log.info("[auto-update] %s", msg)
-                    # No molestar si está al día o no hay release
                     if not msg or "Ya tenés" in msg or "no se encontró" in msg.lower():
                         return
-                    # Notificar activamente cuando se inicia una descarga/actualización
                     _show_msg("Actualización del Agente", f"🚀 {msg}")
                 _do_check_update(notify_fn=_auto_notify)
             except Exception as e:
-                log.debug("[auto-update] Check failed: %s", e)
+                log.warning("[auto-update] Check failed: %s", e)
             time.sleep(60)
     threading.Thread(target=_checker, daemon=True).start()
 
