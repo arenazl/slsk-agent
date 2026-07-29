@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.34"
+VERSION = "2.12.36"
 TRAY_ICON = None
 
 
@@ -663,8 +663,16 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
         await report("error", message=f"connect: {str(e)[:120]}")
         return
 
+    # Sort sources: prioritize peers with free slots (or q==0) and lowest queue length
+    def _src_sort_key(s):
+        q = s.get("queue", 0) or 0
+        has_slots = 1 if (s.get("free_slots") or q == 0) else 0
+        return (-has_slots, q)
+
+    sorted_sources = sorted(sources, key=_src_sort_key)
+
     tried_users = set()
-    for src_idx, src in enumerate(sources):
+    for src_idx, src in enumerate(sorted_sources):
         peer = src.get("username") or src.get("peer")
         remote_path = src.get("remote_path")
         if not peer or not remote_path or peer in tried_users:
@@ -672,10 +680,10 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
         tried_users.add(peer)
         queue = src.get("queue", 0) or 0
         has_slots = bool(src.get("free_slots"))
-        is_last = (src_idx >= len(sources) - 1)
+        is_last = (src_idx >= len(sorted_sources) - 1)
 
         await report("queued", source=peer, queue=queue,
-                     source_idx=src_idx + 1, source_total=len(sources))
+                     source_idx=src_idx + 1, source_total=len(sorted_sources))
 
         try:
             transfer = await client.transfers.download(peer, remote_path)
@@ -686,13 +694,19 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
 
         last_bytes = 0
         stall_count = 0
-        # Give peers 90 seconds to accept handshakes and open upload slots
+        # Smart stall patience:
+        # If last source, wait up to 300s.
+        # If queue > 200 and more sources exist, cycle fast (15s).
+        # If queue > 50 and more sources exist, cycle fast (30s).
+        # Otherwise wait up to 45s for handshake.
         if is_last:
             MAX_STALL = 300
-        elif queue > 500:
-            MAX_STALL = 180
+        elif queue > 200:
+            MAX_STALL = 15
+        elif queue > 50:
+            MAX_STALL = 30
         else:
-            MAX_STALL = 90
+            MAX_STALL = 45
         transfer_started = False
         last_status_sec = 0
 
