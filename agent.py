@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.23"
+VERSION = "2.12.24"
 
 
 def _ver_tuple(v):
@@ -87,7 +87,7 @@ AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".wav", ".aif", ".aiff",
     ".m4a", ".ogg", ".aac", ".wma", ".opus",
 }
-CONFIG_DIR = Path.home() / ".groovesync"
+CONFIG_DIR = Path.home() / ".djfreeapp"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "agent.log"
 
@@ -105,7 +105,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger("groovesync")
+log = logging.getLogger("djfreeapp")
 
 # ---------------------------------------------------------------------------
 # Subprocess helpers (hide cmd windows on Windows)
@@ -2888,8 +2888,8 @@ def _do_check_update(notify_fn=None):
             return
 
         log.info("New version available: v%s -> v%s", current, latest)
-        win_url = data.get("windows_url") or "https://djfreeapp.ar/GrooveSyncAgent.exe"
-        mac_url = data.get("macos_url") or "https://djfreeapp.ar/GrooveSyncAgent-macOS.zip"
+        win_url = data.get("windows_url") or "https://djfreeapp.ar/DjFreeAppAgent.exe"
+        mac_url = data.get("macos_url") or "https://djfreeapp.ar/DjFreeAppAgent-macOS.zip"
 
         if sys.platform == "darwin":
             import zipfile
@@ -2899,8 +2899,8 @@ def _do_check_update(notify_fn=None):
                 notify_fn("No se encontró build de macOS en el release")
                 return
 
-            tmp_zip = Path("/tmp") / "GrooveSyncAgent-macOS.zip"
-            tmp_extract = Path("/tmp") / "GrooveSyncAgent_update"
+            tmp_zip = Path("/tmp") / "DjFreeAppAgent-macOS.zip"
+            tmp_extract = Path("/tmp") / "DjFreeAppAgent_update"
             log.info("Downloading update from %s", zip_url)
             notify_fn(f"Descargando v{latest}...")
             urllib.request.urlretrieve(zip_url, str(tmp_zip))
@@ -2916,10 +2916,10 @@ def _do_check_update(notify_fn=None):
             if getattr(sys, 'frozen', False):
                 # Running as compiled .app bundle
                 current_app = Path(sys.executable).resolve().parent.parent.parent
-                new_app = tmp_extract / "GrooveSyncAgent.app"
+                new_app = tmp_extract / "DjFreeAppAgent.app"
                 if new_app.exists() and current_app.name.endswith(".app"):
                     # Use a shell script to replace after exit
-                    update_sh = Path("/tmp") / "groovesync_update.sh"
+                    update_sh = Path("/tmp") / "djfreeapp_update.sh"
                     update_sh.write_text(f"""#!/bin/bash
 sleep 2
 rm -rf "{current_app}"
@@ -2947,14 +2947,14 @@ rm -f "$0"
                 log.error("No exe url in manifest")
                 return
 
-            tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "GrooveSyncAgent_update.exe"
+            tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "DjFreeAppAgent_update.exe"
             log.info("Downloading update from %s", exe_url)
             urllib.request.urlretrieve(exe_url, str(tmp_path))
             log.info("Downloaded update to %s", tmp_path)
 
             current_exe = Path(sys.executable)
             if getattr(sys, 'frozen', False):
-                bat = Path(os.environ.get("TEMP", "/tmp")) / "groovesync_update.bat"
+                bat = Path(os.environ.get("TEMP", "/tmp")) / "djfreeapp_update.bat"
                 bat.write_text(f"""@echo off
 timeout /t 2 /nobreak >nul
 copy /Y "{tmp_path}" "{current_exe}"
@@ -2992,7 +2992,7 @@ def _start_auto_update_checker():
             try:
                 def _auto_notify(msg):
                     log.info("[auto-update] %s", msg)
-                    _show_msg("GrooveSync Agent", msg)
+                    _show_msg("DjFreeApp Agent", msg)
                 _do_check_update(notify_fn=_auto_notify)
             except Exception as e:
                 log.debug("[auto-update] Check failed: %s", e)
@@ -3007,7 +3007,7 @@ def _start_auto_update_checker():
 if sys.platform == "darwin":
     import rumps
 
-    class GrooveSyncMacApp(rumps.App):
+    class DjFreeAppMacApp(rumps.App):
         def __init__(self):
             icon_path = None
             for p in [
@@ -3021,62 +3021,42 @@ if sys.platform == "darwin":
                 if p.exists():
                     icon_path = str(p)
                     break
-            super().__init__(
-                "DJ Free App",
-                icon=icon_path,
-                quit_button=None,
-            )
+            super().__init__("DjFreeApp", icon=icon_path)
             self.menu = [
-                rumps.MenuItem("Abrir UI", callback=self.on_open_ui),
-                rumps.MenuItem("Abrir carpeta", callback=self.on_open_folder),
-                rumps.MenuItem("Configurar carpeta", callback=self.on_configure_folder),
-                rumps.separator,
-                rumps.MenuItem("Renovar Charts", callback=self.on_refresh_charts),
-                rumps.MenuItem("Estado", callback=self.on_status),
-                rumps.separator,
-                rumps.MenuItem("Ver logs", callback=self.on_view_logs),
-                rumps.MenuItem("Actualizar", callback=self.on_update),
-                rumps.separator,
-                rumps.MenuItem("Salir", callback=self.on_quit),
+                rumps.MenuItem("Abrir carpeta de descargas", callback=self._on_open_folder),
+                rumps.MenuItem("Configurar carpeta...", callback=self._on_configure_folder),
+                None,
+                rumps.MenuItem("Renovar charts", callback=self._on_refresh_charts),
+                rumps.MenuItem("Buscar actualizaciones", callback=self._on_check_update),
+                rumps.MenuItem("Estado", callback=self._on_status),
             ]
 
-        def on_open_ui(self, _):
-            import webbrowser
-            webbrowser.open(f"http://localhost:{PORT}/")
-
-        def on_open_folder(self, _):
+        def _on_open_folder(self, sender):
             folder = get_download_folder()
-            if folder:
-                Path(folder).mkdir(parents=True, exist_ok=True)
+            if folder and os.path.exists(folder):
                 _open_path(folder)
             else:
-                self.on_configure_folder(_)
+                log.warning("Download folder does not exist: %s", folder)
+                _on_configure_folder(None, None)
 
-        def on_configure_folder(self, _):
+        def _on_configure_folder(self, sender):
             folder = _pick_folder()
             if folder:
                 set_download_folder(folder)
-                log.info("Folder configured via tray: %s", folder)
+                log.info("Folder configured via macOS tray: %s", folder)
 
-        def on_status(self, _):
-            folder = get_download_folder() or "(no configurada)"
-            rumps.notification(
-                "DJ Free App Agent",
-                f"v{VERSION} - Puerto {PORT}",
-                f"Carpeta: {folder}",
-            )
-
-        def on_refresh_charts(self, _):
-            log.info("Manual chart refresh requested")
-            rumps.notification("DJ Free App Agent", "", "Renovando charts...")
+        def _on_refresh_charts(self, sender):
+            log.info("Manual chart refresh requested via macOS tray")
+            rumps.notification("DjFreeApp Agent", "", "Renovando charts...")
             def do_scrape():
                 loop = asyncio.new_event_loop()
                 try:
                     count = loop.run_until_complete(scrape_beatport_charts())
                     log.info("Manual scrape done: %d charts", count)
-                    rumps.notification("DJ Free App Agent", "", f"Charts actualizados: {count} géneros")
+                    rumps.notification("DjFreeApp Agent", "", f"Charts actualizados: {count} géneros")
                 except Exception as e:
                     log.error("Manual scrape failed: %s", e)
+                    rumps.notification("DjFreeApp Agent", "Error", f"Fallo al actualizar charts: {e}")
                 finally:
                     loop.close()
             threading.Thread(target=do_scrape, daemon=True).start()
