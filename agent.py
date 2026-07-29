@@ -2996,8 +2996,13 @@ rm -f "$0"
 
             tmp_path = Path(os.environ.get("TEMP", "/tmp")) / "DjFreeAppAgent_update.exe"
             log.info("Downloading update from %s", exe_url)
-            urllib.request.urlretrieve(exe_url, str(tmp_path))
-            log.info("Downloaded update to %s", tmp_path)
+            try:
+                urllib.request.urlretrieve(exe_url, str(tmp_path))
+                log.info("Downloaded update to %s", tmp_path)
+            except Exception as ex_dl:
+                log.error("[update-error] Failed downloading exe update from %s: %s", exe_url, ex_dl)
+                notify_fn(f"Actualización no disponible aún en GitHub Releases: {ex_dl}")
+                return
 
             current_exe = Path(sys.executable)
             if getattr(sys, 'frozen', False):
