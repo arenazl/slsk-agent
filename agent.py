@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.33"
+VERSION = "2.12.34"
 TRAY_ICON = None
 
 
