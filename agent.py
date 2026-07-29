@@ -814,17 +814,22 @@ async def _run_slsk_search(username: str, password: str, query: str, search_wait
     _stopw = {"mix", "the", "and", "ext", "original", "feat", "featuring",
               "remix", "extended", "edit", "club", "radio", "vocal"}
 
+    import unicodedata
+    def _strip_accents(s: str) -> str:
+        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
     # El artist de Beatport suele ser fake ("Jesus Fernandez" para una cover
     # de Danny Tenaglia). Por eso recalculamos artist_kw/title_kw POR ITERACIÓN:
     # query 1 (full) usa artist filter; query 2+ (title only) lo ignora.
     def _kw_for(q: str):
-        if " - " in q:
-            _parts = q.split(" - ", 1)
+        q_clean = _strip_accents(q)
+        if " - " in q_clean:
+            _parts = q_clean.split(" - ", 1)
             ap = _parts[0]
             tp = _parts[1] if len(_parts) > 1 else ""
         else:
             ap = ""
-            tp = q
+            tp = q_clean
         ak = [w for w in re.sub(r'[^\w\s]', ' ', ap.lower()).split()
               if len(w) >= 3 and w not in _stopw]
         tk = [w for w in re.sub(r'[^\w\s]', ' ', tp.lower()).split()
@@ -974,8 +979,9 @@ async def handle_slsk_search(request: web.Request):
     except Exception:
         return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
 
-    username = data.get("username")
-    password = data.get("password")
+    cfg = load_config()
+    username = data.get("username") or cfg.get("username")
+    password = data.get("password") or cfg.get("password")
     query = (data.get("query") or "").strip()
     wait_s = int(data.get("wait") or 20)
 
@@ -1028,8 +1034,9 @@ async def handle_slsk_download(request: web.Request):
     except Exception:
         return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
 
-    username = data.get("username")
-    password = data.get("password")
+    cfg = load_config()
+    username = data.get("username") or cfg.get("username")
+    password = data.get("password") or cfg.get("password")
     sources = data.get("sources") or []
     filename = data.get("filename")
     callback_url = data.get("callback_url") or ""
