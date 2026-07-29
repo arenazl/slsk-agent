@@ -39,7 +39,8 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.24"
+VERSION = "2.12.28"
+TRAY_ICON = None
 
 
 def _ver_tuple(v):
@@ -2548,7 +2549,7 @@ async def handle_restart(request: web.Request):
         win_url = data.get("windows_url") or "https://djfreeapp.ar/GrooveSyncAgent.exe"
         mac_url = data.get("macos_url") or "https://djfreeapp.ar/GrooveSyncAgent-macOS.zip"
 
-        if latest > current:
+        if _ver_tuple(latest) > _ver_tuple(current):
             log.info("Update available: v%s -> v%s", current, latest)
 
             if sys.platform == "darwin":
@@ -2985,18 +2986,22 @@ del "%~f0"
 
 
 def _start_auto_update_checker():
-    """Background thread that automatically polls for agent updates every 5 minutes."""
+    """Background thread that automatically polls for agent updates every 60 seconds (1 minute)."""
     def _checker():
         time.sleep(5)
         while True:
             try:
                 def _auto_notify(msg):
                     log.info("[auto-update] %s", msg)
-                    _show_msg("DjFreeApp Agent", msg)
+                    # No molestar si está al día o no hay release
+                    if not msg or "Ya tenés" in msg or "no se encontró" in msg.lower():
+                        return
+                    # Notificar activamente cuando se inicia una descarga/actualización
+                    _show_msg("Actualización del Agente", f"🚀 {msg}")
                 _do_check_update(notify_fn=_auto_notify)
             except Exception as e:
                 log.debug("[auto-update] Check failed: %s", e)
-            time.sleep(300)
+            time.sleep(60)
     threading.Thread(target=_checker, daemon=True).start()
 
 
@@ -3103,11 +3108,20 @@ def _on_configure_folder(icon, item):
         log.info("Folder configured via tray: %s", folder)
 
 def _show_msg(title, text, icon_type=0x40):
-    if sys.platform == "win32":
-        import ctypes
-        threading.Thread(target=lambda: ctypes.windll.user32.MessageBoxW(0, text, title, icon_type), daemon=True).start()
-    else:
-        log.info("[%s] %s", title, text)
+    log.info("[%s] %s", title, text)
+    global TRAY_ICON
+    if TRAY_ICON is not None and hasattr(TRAY_ICON, 'notify'):
+        try:
+            TRAY_ICON.notify(text, title)
+            return
+        except Exception as e:
+            log.debug("Tray notification failed: %s", e)
+    if sys.platform == "darwin":
+        try:
+            import rumps
+            rumps.notification(title, "", text)
+        except Exception:
+            pass
 
 def _on_status(icon, item):
     folder = get_download_folder() or "(no configurada)"
@@ -3302,24 +3316,26 @@ def _tray_watchdog(icon):
 
 def run_tray(ready_event: threading.Event):
     """Run the pystray icon (Windows/Linux only)."""
+    global TRAY_ICON
     icon = pystray.Icon(
         "groovesync",
         _create_tray_icon(),
         f"DJ Free App v{VERSION} - Online",
         menu=pystray.Menu(
-            pystray.MenuItem("Abrir UI", _on_open_ui, default=True),
-            pystray.MenuItem("Abrir carpeta", _on_open_folder),
-            pystray.MenuItem("Configurar carpeta", _on_configure_folder),
-            pystray.MenuItem("Renovar Sesión Soulseek", _on_slsk_reconnect),
-            pystray.MenuItem("Renovar Charts", _on_refresh_charts),
-            pystray.MenuItem("Estado", _on_status),
+            pystray.MenuItem("🌐  Abrir UI", _on_open_ui, default=True),
+            pystray.MenuItem("📁  Abrir carpeta", _on_open_folder),
+            pystray.MenuItem("⚙️  Configurar carpeta", _on_configure_folder),
+            pystray.MenuItem("🔄  Renovar Sesión Soulseek", _on_slsk_reconnect),
+            pystray.MenuItem("📊  Renovar Charts", _on_refresh_charts),
+            pystray.MenuItem("ℹ️  Estado", _on_status),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Ver logs", _on_view_logs),
-            pystray.MenuItem("Actualizar", _on_update),
+            pystray.MenuItem("📋  Ver logs", _on_view_logs),
+            pystray.MenuItem("🚀  Buscar actualización", _on_update),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Salir", _on_exit),
+            pystray.MenuItem("❌  Salir", _on_exit),
         ),
     )
+    TRAY_ICON = icon
     # Watchdog re-asserts the icon if explorer restarts (pystray's broadcast
     # handler alone is unreliable under rapid explorer crashes).
     threading.Thread(target=_tray_watchdog, args=(icon,), daemon=True).start()
