@@ -1051,6 +1051,30 @@ async def handle_slsk_download(request: web.Request):
     return web.json_response({"ok": True, "status": "started", "source_count": len(sources)})
 
 
+async def handle_slsk_reconnect(request: web.Request):
+    """Fuerza el re-login del cliente de Soulseek para renovar la sesión.
+    Body opcional: {username, password}. Retorna {ok: True, message: "Sesión renovada"}.
+    """
+    if not AIOSLSK_AVAILABLE:
+        return web.json_response({"ok": False, "error": "aioslsk not installed"}, status=501)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    cfg = load_config()
+    username = data.get("username") or cfg.get("username") or "arenazl"
+    password = data.get("password") or cfg.get("password") or "look"
+
+    try:
+        await get_slsk_client(username, password, force_relogin=True)
+        _show_msg("Soulseek", f"Sesión de Soulseek renovada para {username}")
+        log.info("[slsk-reconnect] Sesión de Soulseek renovada con éxito para %s", username)
+        return web.json_response({"ok": True, "message": f"Sesión de Soulseek renovada para {username}"})
+    except Exception as e:
+        log.error("[slsk-reconnect] Error al renovar sesión: %s", e)
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 # ---------------------------------------------------------------------------
 # HTTP Handlers
 # ---------------------------------------------------------------------------
@@ -2718,6 +2742,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/restart", handle_restart)
     app.router.add_post("/api/slsk-download", handle_slsk_download)
     app.router.add_post("/api/slsk-search", handle_slsk_search)
+    app.router.add_post("/api/slsk-reconnect", handle_slsk_reconnect)
+    app.router.add_post("/api/relogin", handle_slsk_reconnect)
     app.router.add_post("/api/tunnel-start", handle_tunnel_start)
     app.router.add_post("/api/tunnel-stop", handle_tunnel_stop)
     app.router.add_get("/api/tunnel-status", handle_tunnel_status)
@@ -3099,6 +3125,26 @@ def _on_refresh_charts(icon, item):
     threading.Thread(target=do_scrape, daemon=True).start()
 
 
+def _on_slsk_reconnect(icon, item):
+    log.info("[tray] Renovando sesión de Soulseek manualmente...")
+    _show_msg("Soulseek", "Renovando sesión de Soulseek...")
+    def do_reconnect():
+        loop = asyncio.new_event_loop()
+        try:
+            cfg = load_config()
+            u = cfg.get("username") or "arenazl"
+            p = cfg.get("password") or "look"
+            loop.run_until_complete(get_slsk_client(u, p, force_relogin=True))
+            log.info("[tray] Sesión de Soulseek renovada con éxito para %s", u)
+            _show_msg("Soulseek", f"Sesión de Soulseek renovada para {u}")
+        except Exception as e:
+            log.error("[tray] Error al renovar sesión: %s", e)
+            _show_msg("Soulseek Error", f"Error al renovar sesión: {e}")
+        finally:
+            loop.close()
+    threading.Thread(target=do_reconnect, daemon=True).start()
+
+
 def _on_view_logs(icon, item):
     _open_path(str(LOG_FILE))
 
@@ -3257,6 +3303,7 @@ def run_tray(ready_event: threading.Event):
             pystray.MenuItem("Abrir UI", _on_open_ui, default=True),
             pystray.MenuItem("Abrir carpeta", _on_open_folder),
             pystray.MenuItem("Configurar carpeta", _on_configure_folder),
+            pystray.MenuItem("Renovar Sesión Soulseek", _on_slsk_reconnect),
             pystray.MenuItem("Renovar Charts", _on_refresh_charts),
             pystray.MenuItem("Estado", _on_status),
             pystray.Menu.SEPARATOR,
