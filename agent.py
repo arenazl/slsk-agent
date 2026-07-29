@@ -654,12 +654,14 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
 
     folder = get_download_folder()
     if not folder:
+        log.error("[DL-ERROR] No download folder configured for '%s'", filename)
         await report("error", message="No download folder configured")
         return
 
     try:
         client = await get_slsk_client(username, password)
     except Exception as e:
+        log.error("[DL-ERROR] Failed to obtain SoulSeek client for '%s': %s", filename, e)
         await report("error", message=f"connect: {str(e)[:120]}")
         return
 
@@ -670,6 +672,7 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
         return (-has_slots, q)
 
     sorted_sources = sorted(sources, key=_src_sort_key)
+    log.info("[DL-START] Target: '%s' | Sources available: %d", filename, len(sorted_sources))
 
     tried_users = set()
     for src_idx, src in enumerate(sorted_sources):
@@ -682,13 +685,15 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
         has_slots = bool(src.get("free_slots"))
         is_last = (src_idx >= len(sorted_sources) - 1)
 
+        log.info("[DL-SOURCE %d/%d] Trying peer '%s' (queue=%d, free_slots=%s, path='%s')",
+                 src_idx + 1, len(sorted_sources), peer, queue, has_slots, remote_path)
         await report("queued", source=peer, queue=queue,
                      source_idx=src_idx + 1, source_total=len(sorted_sources))
 
         try:
             transfer = await client.transfers.download(peer, remote_path)
         except Exception as e:
-            log.debug("download init failed for %s: %s", peer, e)
+            log.warning("[DL-FAIL] Download init failed for peer '%s': %s", peer, e)
             await report("error_source", source=peer, message=str(e)[:100])
             continue
 
@@ -722,20 +727,25 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
                 if not transfer_started:
                     transfer_started = True
                     MAX_STALL = max(MAX_STALL, 120)  # be patient once serving
+                    log.info("[DL-CONNECT] First data packet received from peer '%s' for '%s'", peer, filename)
                 last_bytes = current
                 stall_count = 0
                 if transfer.filesize:
                     pct = int(current / transfer.filesize * 100)
                     speed_kb = int((getattr(transfer, "speed", 0) or 0) / 1024)
+                    log.info("[DL-PROGRESS] '%s' (%d%%, %d KB/s) from '%s'", filename, pct, speed_kb, peer)
                     await report("downloading", pct=pct, speed=speed_kb, source=peer)
             else:
                 stall_count += 1
                 if stall_count - last_status_sec >= 15:
                     last_status_sec = stall_count
+                    log.info("[DL-STALL] Waiting on peer '%s' (%ds/%ds, queue=%d)...", peer, stall_count, MAX_STALL, queue)
                     await report("queued", source=peer, queue=queue,
                                  wait_secs=stall_count, timeout_secs=MAX_STALL,
-                                 source_idx=src_idx + 1, source_total=len(sources))
+                                 source_idx=src_idx + 1, source_total=len(sorted_sources))
                 if stall_count >= MAX_STALL:
+                    log.warning("[DL-TIMEOUT] Peer '%s' stalled for %ds (max=%ds, queue=%d). Moving to next candidate...",
+                                peer, stall_count, MAX_STALL, queue)
                     break
 
         try:
@@ -748,6 +758,7 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
             # The UI keys searchDlStatus by `filename` but needs `local_name` to
             # check the file actually landed in local storage.
             local_name = remote_path.rsplit("\\", 1)[-1] if "\\" in remote_path else remote_path.rsplit("/", 1)[-1]
+            log.info("[DL-SUCCESS] Downloaded '%s' -> '%s' from peer '%s'", filename, local_name, peer)
             await report("completed", source=peer, local_name=local_name)
             # Curación automática: tags (Beatport+IA via server) + ubicar en
             # carpeta de género. En background para no demorar el "completed".
@@ -755,10 +766,11 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
                 folder = get_download_folder()
                 if folder:
                     asyncio.create_task(_curate_downloaded(folder, local_name))
-            except Exception:
-                pass
+            except Exception as ex_c:
+                log.warning("[DL-CURATE] Auto-curation failed: %s", ex_c)
             return
 
+    log.error("[DL-FAILED] All %d sources failed for '%s'", len(sorted_sources), filename)
     await report("error", message="no sources succeeded")
 
 
