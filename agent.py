@@ -1407,10 +1407,24 @@ async def handle_rate(request: web.Request):
 async def handle_delete(request: web.Request):
     body = await request.json()
     filename = body.get("filename")
-    if not filename:
-        return web.json_response({"ok": False, "error": "Missing filename"}, status=400)
+    title = body.get("title", "")
 
-    filepath = _find_file_in_library(filename)
+    filepath = None
+    if filename:
+        filepath = _find_file_in_library(filename)
+
+    if not filepath and title:
+        folder = get_download_folder()
+        if folder:
+            root = Path(folder)
+            t_norm = re.sub(r'[^a-z0-9]', '', title.lower())
+            for p in root.rglob("*"):
+                if p.is_file():
+                    p_norm = re.sub(r'[^a-z0-9]', '', p.name.lower())
+                    if t_norm and t_norm in p_norm:
+                        filepath = p
+                        break
+
     if filepath and filepath.exists():
         parent = filepath.parent
         filepath.unlink()
@@ -1419,11 +1433,15 @@ async def handle_delete(request: web.Request):
         # Clean up empty directory
         folder = get_download_folder()
         if folder and parent != Path(folder) and not any(parent.iterdir()):
-            parent.rmdir()
+            try:
+                parent.rmdir()
+            except Exception:
+                pass
+        return web.json_response({"ok": True, "deleted": str(filepath)})
     else:
-        log.warning("File not found for deletion: %s", filename)
+        log.warning("File not found for deletion: filename=%s title=%s", filename, title)
 
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "deleted": False})
 
 
 def _trash_file(path):
