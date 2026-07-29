@@ -685,15 +685,13 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
 
         last_bytes = 0
         stall_count = 0
-        # Slot peers: 10s ghost check. Active peers: 60s. Hopeless: 180s (last).
-        if has_slots and queue < 50:
-            MAX_STALL = 15
-        elif is_last:
-            MAX_STALL = 180
+        # Give peers 90 seconds to accept handshakes and open upload slots
+        if is_last:
+            MAX_STALL = 300
         elif queue > 500:
-            MAX_STALL = 60
+            MAX_STALL = 180
         else:
-            MAX_STALL = 30
+            MAX_STALL = 90
         transfer_started = False
         last_status_sec = 0
 
