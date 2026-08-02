@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.36"
+VERSION = "2.12.75"
 TRAY_ICON = None
 
 
@@ -2741,6 +2741,26 @@ async def _serve_spa_fallback(request):
     return await _serve_index(request)
 
 
+async def handle_analyze_audio(request):
+    try:
+        data = await request.json()
+        filename = data.get("filename")
+        if not filename:
+            return web.Response(status=400, text="Missing filename")
+            
+        cfg = get_config()
+        base_dir = Path(cfg["download_dir"])
+        subfolder = data.get("subfolder", "")
+        file_path = base_dir / subfolder / filename
+        
+        import audio_analyzer
+        res = await asyncio.to_thread(audio_analyzer.analyze_track, str(file_path))
+        return web.json_response(res)
+    except Exception as e:
+        log.error(f"Analysis error: {e}")
+        return web.Response(status=500, text=str(e))
+
+
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware, logging_middleware], client_max_size=500 * 1024 * 1024)  # 500 MB max upload
 
@@ -2748,6 +2768,7 @@ def create_app() -> web.Application:
     app.router.add_route("OPTIONS", "/{path:.*}", handle_options)
 
     app.router.add_get("/api/status", handle_status)
+    app.router.add_post("/api/analyze-audio", handle_analyze_audio)
     app.router.add_post("/api/save-file", handle_save_file)
     app.router.add_post("/api/move-file", handle_move_file)
     app.router.add_get("/api/library", handle_library)
