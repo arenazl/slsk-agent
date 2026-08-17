@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.75"
+VERSION = "2.12.220"
 TRAY_ICON = None
 
 
@@ -107,6 +107,13 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("djfreeapp")
+
+# Ruido de la librería SoulSeek: los "adding transfer: Transfer(...)" de 3
+# líneas y los tracebacks completos de cada peer que no conecta tapaban el log
+# útil. Se dejan solo los errores; el detalle de peers lo damos nosotros
+# resumido (ver _peer_report en la búsqueda/descarga).
+for _noisy in ("aioslsk", "aioslsk.network", "aioslsk.transfer", "aioslsk.client", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Subprocess helpers (hide cmd windows on Windows)
@@ -470,17 +477,23 @@ async def get_slsk_client(username: str, password: str, force_relogin: bool = Fa
             credentials=CredentialsSettings(username=username, password=password),
             shares=SharesSettings(download=folder),
             network={
-                # Range alto poco usado. Antes era 64321/64421 pero alguno se
-                # bloqueaba en este python (probable Windows Firewall pidiendo
-                # confirmacion para python.exe). 53xxx es menos colisionado.
-                "listening": {"port": 53321, "port_range": 100},
-                "listening_obfuscated": {"port": 53421, "port_range": 100},
+                # E0b (2026-08-02): las claves viejas NO existían en el schema
+                # de aioslsk ("port_range" y "listening_obfuscated" se
+                # ignoraban), así que el puerto de escucha nunca abría y se
+                # tapaba anulando connect_listening_ports con un dummy —
+                # dejando al agente sin conexión inversa (peer-ghost: peers con
+                # slots que nunca entregan). Schema real: listening.port +
+                # listening.obfuscated_port. Verificado: abre y loguea OK.
+                "listening": {"port": 53321, "obfuscated_port": 53421},
             },
         )
         client = SoulSeekClient(settings)
-        async def dummy_connect_ports():
-            pass
-        client.network.connect_listening_ports = dummy_connect_ports
+        # E0b RESUELTO (2026-08-02): antes se anulaba connect_listening_ports
+        # con un dummy vacío (los puertos nunca abrían por el schema mal
+        # escrito) → sin conexión inversa, SoulSeek no puede bajar de peers
+        # detrás de NAT = peer-ghost. Ahora start() los abre solo; NO llamar
+        # connect_listening_ports() a mano acá: start() lo hace y el segundo
+        # bind choca con el primero.
         await client.start()
         await client.login()
         _slsk_client = client
@@ -685,15 +698,19 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
         has_slots = bool(src.get("free_slots"))
         is_last = (src_idx >= len(sorted_sources) - 1)
 
-        log.info("[DL-SOURCE %d/%d] Trying peer '%s' (queue=%d, free_slots=%s, path='%s')",
-                 src_idx + 1, len(sorted_sources), peer, queue, has_slots, remote_path)
+        _t_src = time.time()
+        log.info("[DL-PEER %d/%d] %s | slots=%s cola=%s | archivo: %s",
+                 src_idx + 1, len(sorted_sources), peer,
+                 "SI" if has_slots else "no", queue, remote_path.rsplit("\\", 1)[-1][:50])
         await report("queued", source=peer, queue=queue,
                      source_idx=src_idx + 1, source_total=len(sorted_sources))
 
         try:
             transfer = await client.transfers.download(peer, remote_path)
         except Exception as e:
-            log.warning("[DL-FAIL] Download init failed for peer '%s': %s", peer, e)
+            _why = str(e)[:90]
+            _hint = " (peer inalcanzable: NAT/firewall o se fue)" if "connect" in _why.lower() else ""
+            log.warning("[DL-PEER-FAIL] %s tras %.1fs -> %s%s", peer, time.time() - _t_src, _why, _hint)
             await report("error_source", source=peer, message=str(e)[:100])
             continue
 
@@ -758,7 +775,12 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
             # The UI keys searchDlStatus by `filename` but needs `local_name` to
             # check the file actually landed in local storage.
             local_name = remote_path.rsplit("\\", 1)[-1] if "\\" in remote_path else remote_path.rsplit("/", 1)[-1]
-            log.info("[DL-SUCCESS] Downloaded '%s' -> '%s' from peer '%s'", filename, local_name, peer)
+            try:
+                _mb = round((Path(get_download_folder() or ".") / local_name).stat().st_size / 1048576, 1)
+            except Exception:
+                _mb = "?"
+            log.info("[DL-OK] '%s' bajado de %s en %.0fs | %sMB | guardado como '%s'",
+                     filename[:45], peer, time.time() - _t_src, _mb, local_name[:45])
             await report("completed", source=peer, local_name=local_name)
             # Curación automática: tags (Beatport+IA via server) + ubicar en
             # carpeta de género. En background para no demorar el "completed".
@@ -770,7 +792,8 @@ async def _run_slsk_download(username, password, sources, filename, callback_url
                 log.warning("[DL-CURATE] Auto-curation failed: %s", ex_c)
             return
 
-    log.error("[DL-FAILED] All %d sources failed for '%s'", len(sorted_sources), filename)
+    log.error("[DL-SIN-SUERTE] '%s': fallaron las %d fuentes — ninguno de los peers entregó el archivo",
+              filename[:50], len(sorted_sources))
     await report("error", message="no sources succeeded")
 
 
@@ -1019,6 +1042,8 @@ async def handle_slsk_search(request: web.Request):
         )
 
     try:
+        t0 = time.time()
+        log.info("[SEARCH] '%s' (espera %ds) — consultando la red SoulSeek...", query, wait_s)
         try:
             results = await _run_slsk_search(username, password, query, search_wait=wait_s)
         except Exception as e:
@@ -1041,8 +1066,31 @@ async def handle_slsk_search(request: web.Request):
             await get_slsk_client(username, password, force_relogin=True)
             results = await _run_slsk_search(username, password, query, search_wait=wait_s)
     except Exception as e:
-        log.exception("slsk-search error")
+        log.error("[SEARCH-ERROR] '%s' -> %s", query, str(e)[:200])
         return web.json_response({"ok": False, "error": str(e)[:200]}, status=500)
+
+    # Reporte de la búsqueda: qué llegó y de quién, en UNA línea legible en vez
+    # del silencio de antes (o del ruido de aioslsk).
+    took = time.time() - t0
+    peers = {r.get("username") for r in results if r.get("username")}
+    free = [r for r in results if r.get("free_slots")]
+    queued = len(results) - len(free)
+    flacs = sum(1 for r in results if str(r.get("filename", "")).lower().endswith(".flac"))
+    log.info(
+        "[SEARCH-OK] '%s' | %d archivos de %d peers en %.1fs | libres:%d encolados:%d | flac:%d mp3:%d",
+        query, len(results), len(peers), took, len(free), queued, flacs, len(results) - flacs,
+    )
+    if results:
+        top = sorted(results, key=lambda r: (not r.get("free_slots"), r.get("queue") or 0))[:3]
+        for r in top:
+            log.info(
+                "[SEARCH-TOP] %s | peer=%s slots=%s cola=%s %s",
+                str(r.get("filename", ""))[:45], r.get("username"),
+                "SI" if r.get("free_slots") else "no", r.get("queue"),
+                f"{round((r.get('size') or 0)/1048576, 1)}MB" if r.get("size") else "",
+            )
+    else:
+        log.warning("[SEARCH-EMPTY] '%s' | ningún peer respondió en %.1fs — probá otro término o revisá la sesión SoulSeek", query, took)
 
     return web.json_response({"ok": True, "results": results, "count": len(results)})
 
@@ -2709,10 +2757,18 @@ async def handle_options(request: web.Request):
 
 @web.middleware
 async def logging_middleware(request, handler):
-    log.info("-> %s %s (from %s)", request.method, request.path, request.headers.get("Origin", "direct"))
+    # Endpoints de POLLING (el front los llama cada 15s): no se loguean salvo
+    # que fallen. Antes inundaban el log con 8 líneas por minuto y tapaban lo
+    # que de verdad importa (búsquedas y descargas).
+    quiet = request.path in (
+        "/api/status", "/api/config", "/api/library", "/api/ping",
+    ) or request.path.startswith("/api/audio/")
+    if not quiet:
+        log.info("-> %s %s (from %s)", request.method, request.path, request.headers.get("Origin", "direct"))
     try:
         response = await handler(request)
-        log.info("<- %s %s -> %s", request.method, request.path, response.status)
+        if not quiet or response.status >= 400:
+            log.info("<- %s %s -> %s", request.method, request.path, response.status)
         return response
     except Exception as e:
         log.error("<- %s %s -> ERROR: %s", request.method, request.path, e)
@@ -2815,7 +2871,18 @@ def create_app() -> web.Application:
 
 async def start_server():
     app = create_app()
-    runner = web.AppRunner(app)
+    # Access log de aiohttp FILTRADO: el front hace polling de /api/status y
+    # /api/config cada pocos segundos y esas líneas tapaban el log útil
+    # (búsquedas y descargas). Se registran solo los endpoints que importan.
+    class _QuietAccessLogger(web.AbstractAccessLogger):
+        QUIET = ("/api/status", "/api/config", "/api/library", "/api/ping")
+        def log(self, request, response, time):
+            if request.path.startswith(self.QUIET) or request.path.startswith("/api/audio/"):
+                if response.status < 400:
+                    return
+            self.logger.info('%s %s -> %s (%.2fs)', request.method, request.path, response.status, time)
+
+    runner = web.AppRunner(app, access_log_class=_QuietAccessLogger)
     await runner.setup()
     site = web.TCPSite(runner, HOST, PORT)
     await site.start()
