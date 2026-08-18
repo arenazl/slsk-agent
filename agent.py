@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.263"
+VERSION = "2.12.264"
 TRAY_ICON = None
 
 
@@ -3257,6 +3257,61 @@ async def handle_analysis_all(request):
     return web.json_response(_AN_STORE)
 
 
+async def handle_audio_clip(request):
+    """Devuelve UN TRAMO del tema, ya recortado, en WAV.
+
+    El Lab necesita audio CRUDO (transcodificar a MP3 mete delay de encoder y
+    corre la grilla), pero el archivo entero no llega: el navegador no puede
+    hablarle al agente en localhost desde una pagina https, asi que el audio
+    viaja por Cloud Run en base64 sobre WebSocket y un FLAC de 35 MB lo
+    revienta (500). Pedir un Range tampoco sirve: un FLAC no decodifica desde
+    el medio, necesita su cabecera.
+
+    Aca ffmpeg corta el tramo y lo entrega como WAV (PCM, sin perdida ni
+    priming). 30 s son ~5 MB, que el tunel pasa sin problema.
+
+    Query: path (relativo), from (seg), dur (seg, tope 90).
+    El -ss va DESPUES del -i a proposito: es mas lento pero exacto al sample;
+    con -ss antes, ffmpeg salta por keyframes y se corre el arranque.
+    """
+    rel = request.query.get("path", "")
+    if not rel:
+        return web.json_response({"error": "falta path"}, status=400)
+    try:
+        desde = max(0.0, float(request.query.get("from", 0)))
+        dur = min(90.0, max(1.0, float(request.query.get("dur", 30))))
+    except ValueError:
+        return web.json_response({"error": "from/dur invalidos"}, status=400)
+
+    nombre = rel.split("/")[-1]
+    sub = "/".join(rel.split("/")[:-1])
+    target = _an_resolve(nombre, sub)
+    if not target:
+        return web.json_response({"error": "archivo no encontrado"}, status=404)
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return web.json_response({"error": "ffmpeg no instalado"}, status=500)
+
+    cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error",
+           "-i", str(target), "-ss", f"{desde:.6f}", "-t", f"{dur:.6f}",
+           "-vn", "-map", "a:0", "-f", "wav", "-acodec", "pcm_s16le", "-"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "timeout cortando el audio"}, status=504)
+    if proc.returncode != 0 or not out:
+        return web.json_response(
+            {"error": (err or b"").decode("utf-8", "ignore")[:200] or "ffmpeg fallo"},
+            status=500)
+    log.info("[CLIP] %s  %.2fs +%.1fs  -> %.1f MB", nombre[:44], desde, dur, len(out) / 1048576)
+    return web.Response(body=out, content_type="audio/wav",
+                        headers={"Access-Control-Allow-Origin": "*",
+                                 "X-Clip-Start": f"{desde:.6f}"})
+
+
 async def handle_analyze_audio(request):
     try:
         data = await request.json()
@@ -3298,6 +3353,7 @@ def create_app() -> web.Application:
     app.router.add_route("OPTIONS", "/{path:.*}", handle_options)
 
     app.router.add_get("/api/status", handle_status)
+    app.router.add_get("/api/audio-clip", handle_audio_clip)
     app.router.add_post("/api/analyze-audio", handle_analyze_audio)
     app.router.add_post("/api/analyze-queue", handle_analyze_queue_add)
     app.router.add_get("/api/analyze-queue", handle_analyze_queue_status)
