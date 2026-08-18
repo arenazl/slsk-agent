@@ -39,7 +39,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.12.220"
+VERSION = "2.12.263"
 TRAY_ICON = None
 
 
@@ -1034,6 +1034,7 @@ async def handle_slsk_search(request: web.Request):
     password = data.get("password") or cfg.get("password")
     query = (data.get("query") or "").strip()
     wait_s = int(data.get("wait") or 20)
+    save_slsk_creds(username, password)
 
     if not username or not password or not query:
         return web.json_response(
@@ -1093,6 +1094,306 @@ async def handle_slsk_search(request: web.Request):
         log.warning("[SEARCH-EMPTY] '%s' | ningún peer respondió en %.1fs — probá otro término o revisá la sesión SoulSeek", query, took)
 
     return web.json_response({"ok": True, "results": results, "count": len(results)})
+
+
+# ─── COLA DE DESCARGAS (vive en el AGENTE, no en el browser) ─────────────
+# Antes la cola vivia en el JavaScript de la pestania: una recarga, un deploy o
+# cerrar el navegador la borraba y lo pendiente se perdia a mitad. Ahora vive
+# aca, que es el proceso que realmente baja y esta siempre vivo; la UI pasa a
+# ser un visor. Se persiste en disco para sobrevivir reinicios del agente.
+#
+# Regla de descarga automatica ("ganador absoluto", spec del dueño):
+#   lossless (FLAC/AIFF/WAV) + slot libre + cola 0 + version entera -> baja solo.
+#   Si no hay ninguno asi, el tema queda en "needs_choice" ESPERANDO al dueño y
+#   la cola sigue con el siguiente (no se traba).
+# Credenciales SoulSeek de la ultima operacion valida. El config del agente
+# guarda el usuario de la APP (ej. "Look"), NO el de SoulSeek (ej. "arenazl"):
+# usarlo para la cola daba INVALIDPASS y dejaba el cliente roto ("failed to
+# connect listening port" en cadena). Se recuerdan las que ya funcionaron.
+_LAST_SLSK_CREDS = {"user": "", "pass": ""}
+
+
+def save_slsk_creds(user, pwd):
+    """Guarda las credenciales de SoulSeek EN EL AGENTE (config.json), en
+    campos propios (slsk_user/slsk_pass) separados de "username", que es el
+    usuario de la APP. Antes solo viajaban en cada request del front: cualquier
+    camino nuevo que se olvidara de mandarlas terminaba usando el usuario de la
+    app contra SoulSeek -> INVALIDPASS + cliente roto en cadena. Ahora el agente
+    las recuerda y sobreviven a reinicios."""
+    if not user or not pwd:
+        return
+    _LAST_SLSK_CREDS["user"], _LAST_SLSK_CREDS["pass"] = user, pwd
+    try:
+        cfg = load_config()
+        if cfg.get("slsk_user") != user or cfg.get("slsk_pass") != pwd:
+            cfg["slsk_user"], cfg["slsk_pass"] = user, pwd
+            save_config(cfg)
+            log.info("Credenciales SoulSeek guardadas en el agente (usuario %s)", user)
+    except Exception as e:
+        log.warning("No se pudieron guardar las credenciales SoulSeek: %s", e)
+
+
+def get_slsk_creds(req_user=None, req_pass=None):
+    """Credenciales a usar: las del request si vienen, si no las guardadas.
+    NUNCA cae al "username" del config (ese es el usuario de la app)."""
+    if req_user and req_pass:
+        return req_user, req_pass
+    if _LAST_SLSK_CREDS["user"] and _LAST_SLSK_CREDS["pass"]:
+        return _LAST_SLSK_CREDS["user"], _LAST_SLSK_CREDS["pass"]
+    cfg = load_config()
+    return cfg.get("slsk_user", ""), cfg.get("slsk_pass", "")
+_QUEUE = []
+_QUEUE_TASK = None
+_QUEUE_FILE = CONFIG_DIR / "queue.json"
+_LOSSLESS_EXT = (".flac", ".aiff", ".aif", ".wav")
+
+
+def _queue_save():
+    try:
+        liviano = [{k: v for k, v in i.items() if k not in ("results", "slsk_pass")}
+                   for i in _QUEUE]
+        _QUEUE_FILE.write_text(json.dumps(liviano, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _queue_load():
+    try:
+        if _QUEUE_FILE.exists():
+            data = json.loads(_QUEUE_FILE.read_text(encoding="utf-8"))
+            # Solo vuelve lo que quedo SIN TERMINAR. Lo ya bajado/fallado de la
+            # sesion anterior no revive: mezclado con la tanda nueva ensuciaba
+            # la vista ("me trae temas de otras tandas").
+            data = [i for i in data
+                    if i.get("status") not in ("done", "error", "not_found")]
+            for i in data:
+                if i.get("status") in ("searching", "downloading", "pending_download"):
+                    i["status"] = "pending"
+            _QUEUE.extend(data)
+            log.info("[COLA] recuperados %d tema(s) de la sesion anterior", len(data))
+    except Exception as e:
+        log.warning("[COLA] no se pudo recuperar: %s", e)
+
+
+def _is_lossless(name):
+    return str(name or "").lower().endswith(_LOSSLESS_EXT)
+
+
+def _pick_absolute_winner(results):
+    """Candidato que se puede bajar SIN preguntar, o None.
+    Absoluto = lossless + slot libre + cola 0 + version entera."""
+    libres = [r for r in results
+              if r.get("free_slots") and not (r.get("queue") or 0)
+              and _is_lossless(r.get("filename"))]
+    if not libres:
+        return None
+    durs = sorted([d for d in (r.get("duration") or r.get("length") or 0 for r in results) if d])
+    if durs:
+        mediana = durs[len(durs) // 2]
+        enteros = [r for r in libres if (r.get("duration") or r.get("length") or 0) >= mediana * 0.8]
+        libres = enteros or libres
+    orden = {".flac": 0, ".wav": 1, ".aiff": 2, ".aif": 2}
+    libres.sort(key=lambda r: (orden.get(os.path.splitext(str(r.get("filename", "")).lower())[1], 9),
+                               -(r.get("size") or 0)))
+    return libres[0]
+
+
+async def _queue_worker():
+    """Procesa la cola de a UNO: busca -> gana absoluto? baja : espera decision."""
+    global _QUEUE_TASK
+    try:
+        while True:
+            item = next((i for i in _QUEUE if i["status"] == "pending"), None)
+            if not item:
+                break
+            user, pwd = get_slsk_creds(item.get("slsk_user"), item.get("slsk_pass"))
+            if not pwd:
+                item["status"] = "error"
+                item["message"] = "sin credenciales SoulSeek — hacé una búsqueda primero"
+                _queue_save()
+                log.warning("[COLA] sin credenciales SoulSeek para '%s'", item["query"][:40])
+                continue
+            item["status"] = "searching"
+            _queue_save()
+            pend = sum(1 for i in _QUEUE if i["status"] in ("pending", "searching"))
+            log.info("[COLA] buscando '%s' (%d en cola)", item["query"][:50], pend)
+            try:
+                results = await _run_slsk_search(user, pwd, item["query"], search_wait=20)
+            except Exception as e:
+                err = str(e).lower()
+                if "listening port" in err or "no valid session" in err or "connection" in err:
+                    # cliente roto de un intento anterior: reinstanciar y reintentar
+                    log.warning("[COLA] cliente SoulSeek roto (%s) — relogin y reintento", str(e)[:60])
+                    try:
+                        await get_slsk_client(user, pwd, force_relogin=True)
+                        results = await _run_slsk_search(user, pwd, item["query"], search_wait=20)
+                    except Exception as e2:
+                        e = e2
+                    else:
+                        item["results"] = results[:25]
+                        e = None
+                if e is not None:
+                    item["status"] = "error"
+                    item["message"] = str(e)[:120]
+                    _queue_save()
+                    log.warning("[COLA] busqueda fallo: %s", str(e)[:80])
+                    continue
+            item["results"] = results[:25]
+            if not results:
+                item["status"] = "not_found"
+                _queue_save()
+                log.info("[COLA] sin resultados: '%s'", item["query"][:50])
+                continue
+            winner = _pick_absolute_winner(results)
+            if not winner:
+                item["status"] = "needs_choice"
+                item["candidates"] = [
+                    {"filename": r.get("filename"), "username": r.get("username"),
+                     "size": r.get("size"), "free_slots": r.get("free_slots"),
+                     "queue": r.get("queue")} for r in results[:10]]
+                _queue_save()
+                log.info("[COLA] '%s': sin ganador absoluto (%d candidatos) - ESPERA decision",
+                         item["query"][:40], len(results))
+                continue
+            item["status"] = "downloading"
+            item["chosen"] = winner.get("filename")
+            _queue_save()
+            log.info("[COLA] ganador absoluto: %s (peer %s)",
+                     str(winner.get("filename"))[:48], winner.get("username"))
+            ordenados = [winner] + [r for r in results if r is not winner][:4]
+            try:
+                await _run_slsk_download(user, pwd, ordenados, winner.get("filename"),
+                                         item.get("callback_url") or "")
+                item["status"] = "done"
+                # Recien bajado: se analiza SOLO, en background. Asi el tema
+                # llega a la biblioteca con BPM, grilla y momentos de enganche
+                # ya resueltos, en vez de esperar a que alguien lo pida.
+                _an_enqueue([{"filename": Path(str(winner.get("filename"))).name}])
+            except Exception as e:
+                item["status"] = "error"
+                item["message"] = str(e)[:120]
+            _queue_save()
+    finally:
+        _QUEUE_TASK = None
+
+
+def _queue_kick():
+    global _QUEUE_TASK
+    if _QUEUE_TASK is None or _QUEUE_TASK.done():
+        _QUEUE_TASK = asyncio.create_task(_queue_worker())
+
+
+async def handle_slsk_creds(request):
+    """El front siembra aca las credenciales de SoulSeek apenas conecta, y el
+    agente las guarda. Asi cualquier camino que baje algo (cola, Discovery,
+    reintentos tras un reinicio) las tiene, sin que cada request tenga que
+    acordarse de mandarlas."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    u, pw = data.get("username"), data.get("password")
+    if not u or not pw:
+        return web.json_response({"ok": False, "error": "faltan credenciales"}, status=400)
+    save_slsk_creds(u, pw)
+    return web.json_response({"ok": True, "user": u})
+
+
+# ARRANQUE: credenciales SoulSeek guardadas + cola sin terminar de la sesion
+# anterior. Sin esto la cola no sobrevive un reinicio del agente.
+try:
+    _c = load_config()
+    if _c.get("slsk_user") and _c.get("slsk_pass"):
+        _LAST_SLSK_CREDS["user"], _LAST_SLSK_CREDS["pass"] = _c["slsk_user"], _c["slsk_pass"]
+except Exception:
+    pass
+
+_queue_load()
+
+
+async def handle_queue_add(request):
+    """Body {items:[{artist,title,query?}], username?, password?, callback_url?}"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    items = data.get("items") or []
+    if isinstance(items, dict):
+        items = [items]
+    agregados = 0
+    activos = ("pending", "searching", "downloading", "needs_choice")
+    for it in items:
+        q = (it.get("query") or (str(it.get("artist", "")) + " " + str(it.get("title", "")))).strip()
+        if not q:
+            continue
+        if any(i["query"].lower() == q.lower() and i["status"] in activos for i in _QUEUE):
+            continue
+        _QUEUE.append({
+            "id": "q" + str(int(time.time() * 1000) % 10000000) + str(len(_QUEUE)),
+            "artist": it.get("artist", ""), "title": it.get("title", ""),
+            "query": q, "status": "pending", "added": int(time.time()),
+            "slsk_user": data.get("username"), "slsk_pass": data.get("password"),
+            "callback_url": data.get("callback_url", ""),
+        })
+        agregados += 1
+    _queue_save()
+    _queue_kick()
+    log.info("[COLA] +%d tema(s) - activos: %d", agregados,
+             sum(1 for i in _QUEUE if i["status"] in activos))
+    return web.json_response({"ok": True, "added": agregados, "queue": len(_QUEUE)})
+
+
+async def handle_queue_status(request):
+    vista = [{k: v for k, v in i.items() if k not in ("slsk_pass", "results", "slsk_user")}
+             for i in _QUEUE]
+    return web.json_response({"ok": True, "queue": vista})
+
+
+async def handle_queue_choose(request):
+    """El dueño elige para un tema en needs_choice. Body {id, filename}."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    item = next((i for i in _QUEUE if i["id"] == data.get("id")), None)
+    if not item:
+        return web.json_response({"ok": False, "error": "id no encontrado"}, status=404)
+    elegido = next((r for r in (item.get("results") or [])
+                    if r.get("filename") == data.get("filename")), None)
+    if not elegido:
+        return web.json_response({"ok": False, "error": "candidato no encontrado"}, status=404)
+    cfg = load_config()
+    ordenados = [elegido] + [r for r in (item.get("results") or []) if r is not elegido][:4]
+    item["status"] = "downloading"
+    item["chosen"] = elegido.get("filename")
+    _queue_save()
+
+    async def _bajar():
+        try:
+            await _run_slsk_download(item.get("slsk_user") or cfg.get("username"),
+                                     item.get("slsk_pass") or cfg.get("password"),
+                                     ordenados, elegido.get("filename"),
+                                     item.get("callback_url") or "")
+            item["status"] = "done"
+            _an_enqueue([{"filename": Path(str(elegido.get("filename"))).name}])
+        except Exception as e:
+            item["status"] = "error"
+            item["message"] = str(e)[:120]
+        _queue_save()
+
+    asyncio.create_task(_bajar())
+    log.info("[COLA] eleccion del dueño: %s", str(elegido.get("filename"))[:50])
+    return web.json_response({"ok": True})
+
+
+async def handle_queue_clear(request):
+    """Saca los terminados (o todo con ?all=1)."""
+    if request.query.get("all"):
+        _QUEUE[:] = []
+    else:
+        _QUEUE[:] = [i for i in _QUEUE if i["status"] not in ("done", "error", "not_found")]
+    _queue_save()
+    return web.json_response({"ok": True, "queue": len(_QUEUE)})
 
 
 async def handle_slsk_download(request: web.Request):
@@ -1432,15 +1733,15 @@ async def handle_move_file(request: web.Request):
     return web.json_response({"ok": True, "synced": synced})
 
 
-async def handle_library(request: web.Request):
-    """Return ONLY file info: filename, size_mb, format, subfolder. No metadata."""
+def _scan_library():
+    """Archivos de audio de la biblioteca: filename, subfolder, formato, mtime.
+    Compartido por /api/library y por el lote de analisis."""
     folder = get_download_folder()
     if not folder:
-        return web.json_response([])
-
+        return []
     root = Path(folder)
     if not root.exists():
-        return web.json_response([])
+        return []
 
     library = []
 
@@ -1473,7 +1774,12 @@ async def handle_library(request: web.Request):
             "mtime": mtime,
         })
 
-    return web.json_response(library)
+    return library
+
+
+async def handle_library(request: web.Request):
+    """Return ONLY file info: filename, size_mb, format, subfolder. No metadata."""
+    return web.json_response(_scan_library())
 
 
 async def handle_config(request: web.Request):
@@ -2797,6 +3103,160 @@ async def _serve_spa_fallback(request):
     return await _serve_index(request)
 
 
+# ─── ANALISIS DE TEMAS: persistente, en background y por lotes ────────────
+# Antes se analizaba SOLO a demanda y el resultado vivia en RAM: cada reinicio
+# del agente re-analizaba todo de cero (~15 s por tema) y un tema recien bajado
+# llegaba a la biblioteca sin BPM ni grilla. Ahora el resultado se guarda en
+# disco, cada descarga encola su analisis, y el worker corre SOLO cuando no hay
+# descargas en curso: aprovecha el ocio sin robarle ancho de banda a lo que el
+# dueño esta esperando.
+_AN_FILE = CONFIG_DIR / "track_analysis.json"
+_AN_STORE = {}
+_AN_QUEUE = []          # [{"filename","subfolder"}] pendientes
+_AN_TASK = None
+_AN_DONE = 0            # analizados desde que arranco el agente
+_AN_CURRENT = ""
+
+
+def _an_load():
+    global _AN_STORE
+    try:
+        if _AN_FILE.exists():
+            _AN_STORE = json.loads(_AN_FILE.read_text(encoding="utf-8"))
+            log.info("[ANALISIS] %d temas ya analizados en disco", len(_AN_STORE))
+    except Exception as e:
+        log.warning("[ANALISIS] no se pudo leer el store: %s", e)
+        _AN_STORE = {}
+
+
+def _an_save():
+    try:
+        _AN_FILE.write_text(json.dumps(_AN_STORE, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log.warning("[ANALISIS] no se pudo guardar: %s", e)
+
+
+def _an_busy():
+    """True si el agente esta ocupado con lo que el dueño esta esperando."""
+    return any(i.get("status") in ("searching", "downloading") for i in _QUEUE)
+
+
+def _an_enqueue(items):
+    """items: [{filename, subfolder}]. Ignora lo ya analizado y lo repetido."""
+    n = 0
+    for it in items:
+        fn = it.get("filename")
+        if not fn or fn in _AN_STORE:
+            continue
+        if any(q["filename"] == fn for q in _AN_QUEUE):
+            continue
+        _AN_QUEUE.append({"filename": fn, "subfolder": it.get("subfolder", "")})
+        n += 1
+    if n:
+        _an_kick()
+    return n
+
+
+async def _an_worker():
+    global _AN_TASK, _AN_DONE, _AN_CURRENT
+    import audio_analyzer
+    try:
+        while _AN_QUEUE:
+            # Ocio: si hay una descarga en curso, esperar. El analisis es
+            # pesado en CPU y no puede competir con lo que se esta bajando.
+            if _an_busy():
+                await asyncio.sleep(5)
+                continue
+            it = _AN_QUEUE[0]
+            _AN_CURRENT = it["filename"]
+            path = _an_resolve(it["filename"], it.get("subfolder", ""))
+            if not path:
+                _AN_QUEUE.pop(0)
+                continue
+            try:
+                res = await asyncio.to_thread(audio_analyzer.analyze_track, str(path))
+                if res and not res.get("error"):
+                    res["subfolder"] = it.get("subfolder", "") or path.parent.name
+                    _AN_STORE[it["filename"]] = res
+                    _AN_DONE += 1
+                    mp = len(res.get("mix", {}).get("mixPoints", []))
+                    log.info("[ANALISIS] %s -> %.2f bpm, %d momentos (%d en cola)",
+                             it["filename"][:44], res.get("bpm", 0), mp, len(_AN_QUEUE) - 1)
+                    if _AN_DONE % 5 == 0:
+                        _an_save()
+                else:
+                    log.warning("[ANALISIS] fallo %s: %s", it["filename"][:40],
+                                (res or {}).get("error", "?"))
+            except Exception as e:
+                log.warning("[ANALISIS] error en %s: %s", it["filename"][:40], str(e)[:60])
+            if _AN_QUEUE and _AN_QUEUE[0] is it:
+                _AN_QUEUE.pop(0)
+            await asyncio.sleep(0.2)   # respirar entre temas
+    finally:
+        _AN_CURRENT = ""
+        _an_save()
+        _AN_TASK = None
+
+
+def _an_kick():
+    global _AN_TASK
+    if _AN_TASK is None or _AN_TASK.done():
+        _AN_TASK = asyncio.create_task(_an_worker())
+
+
+def _an_resolve(filename, subfolder=""):
+    cfg = load_config()
+    base = Path(cfg.get("folder") or "")
+    for cand in ([base / subfolder / filename] if subfolder else []) + [base / filename]:
+        if cand.exists() and cand.is_file():
+            return cand
+    return _find_file_in_library(filename)
+
+
+_an_load()
+
+
+async def handle_analyze_queue_add(request):
+    """Encola analisis por lote. Body: {genre?} o {items:[{filename,subfolder}]}.
+    Con 'genre' toma de la biblioteca los de ese genero que falten (sin genre =
+    TODA la biblioteca). Responde cuantos entraron y cuantos ya estaban."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    items = data.get("items")
+    if not items:
+        genre = (data.get("genre") or "").strip()
+        items = []
+        for f in _scan_library():
+            g = f.get("subfolder", "")
+            if genre and g.lower() != genre.lower():
+                continue
+            items.append({"filename": f.get("filename"), "subfolder": g})
+    total = len(items)
+    n = _an_enqueue(items)
+    log.info("[ANALISIS] +%d en cola (%d ya estaban) - pendientes: %d",
+             n, total - n, len(_AN_QUEUE))
+    return web.json_response({"ok": True, "added": n, "already": total - n,
+                              "pending": len(_AN_QUEUE)})
+
+
+async def handle_analyze_queue_status(request):
+    return web.json_response({
+        "ok": True,
+        "pending": len(_AN_QUEUE),
+        "done": _AN_DONE,
+        "analyzed": len(_AN_STORE),
+        "current": _AN_CURRENT,
+        "idle": not _an_busy(),
+    })
+
+
+async def handle_analysis_all(request):
+    """Todo lo analizado, para que la UI lo use sin pedir tema por tema."""
+    return web.json_response(_AN_STORE)
+
+
 async def handle_analyze_audio(request):
     try:
         data = await request.json()
@@ -2804,13 +3264,27 @@ async def handle_analyze_audio(request):
         if not filename:
             return web.Response(status=400, text="Missing filename")
             
-        cfg = get_config()
-        base_dir = Path(cfg["download_dir"])
+        # get_config() no existe y la clave del config es "folder", no
+        # "download_dir": este endpoint tiraba 500 SIEMPRE, asi que el Lab
+        # nunca llego al agente y caia al JSON estatico. Se resuelve con el
+        # mismo buscador que usa el resto (tolera subcarpeta equivocada).
         subfolder = data.get("subfolder", "")
-        file_path = base_dir / subfolder / filename
+        file_path = _an_resolve(filename, subfolder)
+        if not file_path:
+            return web.json_response({"error": "File not found"}, status=404)
         
+        # Store en disco primero: analizar cuesta ~15 s de CPU y el resultado
+        # no cambia mientras el archivo sea el mismo.
+        cached = _AN_STORE.get(filename)
+        if cached and not data.get("force"):
+            return web.json_response(cached)
+
         import audio_analyzer
         res = await asyncio.to_thread(audio_analyzer.analyze_track, str(file_path))
+        if res and not res.get("error"):
+            res["subfolder"] = subfolder or Path(file_path).parent.name
+            _AN_STORE[filename] = res
+            _an_save()
         return web.json_response(res)
     except Exception as e:
         log.error(f"Analysis error: {e}")
@@ -2825,6 +3299,9 @@ def create_app() -> web.Application:
 
     app.router.add_get("/api/status", handle_status)
     app.router.add_post("/api/analyze-audio", handle_analyze_audio)
+    app.router.add_post("/api/analyze-queue", handle_analyze_queue_add)
+    app.router.add_get("/api/analyze-queue", handle_analyze_queue_status)
+    app.router.add_get("/api/analysis-all", handle_analysis_all)
     app.router.add_post("/api/save-file", handle_save_file)
     app.router.add_post("/api/move-file", handle_move_file)
     app.router.add_get("/api/library", handle_library)
@@ -2845,6 +3322,11 @@ def create_app() -> web.Application:
     app.router.add_post("/api/refresh-charts", handle_refresh_charts)
     app.router.add_post("/api/restart", handle_restart)
     app.router.add_post("/api/slsk-download", handle_slsk_download)
+    app.router.add_post("/api/slsk-creds", handle_slsk_creds)
+    app.router.add_post("/api/queue/add", handle_queue_add)
+    app.router.add_get("/api/queue", handle_queue_status)
+    app.router.add_post("/api/queue/choose", handle_queue_choose)
+    app.router.add_post("/api/queue/clear", handle_queue_clear)
     app.router.add_post("/api/slsk-search", handle_slsk_search)
     app.router.add_post("/api/slsk-reconnect", handle_slsk_reconnect)
     app.router.add_post("/api/relogin", handle_slsk_reconnect)

@@ -99,6 +99,45 @@ def _first_kick_anchor(y, sr, beat_len):
     return float(t[k] + frac * 32 / sr), n_kicks
 
 
+def _cue_attack(y, sr, t_cand, beat_len):
+    """Lleva un CUE de entrada al ATAQUE del bombo, no a su pico.
+
+    La grilla se ancla al PICO del golpe (el centro de la montañita), que es lo
+    correcto para medir fase. Pero un cue puesto en el pico entra con medio
+    golpe ya consumido y se escucha MORDIDO (spec del dueño, 2026-08-18).
+
+    Como el candidato YA cae en el pico, el ataque esta inmediatamente antes:
+    se camina hacia atras hasta que la envolvente de graves baja al 20% del
+    valor del pico, sin alejarse mas de 1/8 de beat. Buscar el maximo en una
+    ventana ancha no sirve: a 120 BPM la ventana abarca el golpe anterior y el
+    resultado cae un beat atras.
+    """
+    limite = beat_len * 0.125
+    i0 = max(0, int((t_cand - limite * 1.5) * sr))
+    i1 = min(len(y), int((t_cand + limite * 0.5) * sr))
+    if i1 - i0 < int(sr * 0.02):
+        return t_cand
+    env, t = _low_env(y[i0:i1], sr)
+    if env is None or env.max() <= 0:
+        return t_cand
+    # posicion del candidato dentro de la ventana
+    k = int(np.argmin(np.abs((t + i0 / sr) - t_cand)))
+    pico = float(env[k])
+    if pico <= 0:
+        return t_cand
+    umbral = pico * 0.2
+    j = k
+    while j > 0 and env[j] > umbral and (t[k] - t[j]) < limite:
+        j -= 1
+    t_ataque = float(t[j] + i0 / sr)
+    # 12 ms de aire ANTES del ataque ("atrasalos un poco"): al filo del
+    # transitorio cualquier redondeo del decodificador se come el arranque.
+    t_ataque = max(0.0, t_ataque - 0.012)
+    if t_ataque >= t_cand or (t_cand - t_ataque) > beat_len * 0.2:
+        return max(0.0, t_cand - 0.012)
+    return t_ataque
+
+
 def _measure_anchor_error(y, sr, beat_len, anchor, spans):
     """Mediana del corrimiento de los ataques reales de graves vs la grilla.
 
@@ -254,6 +293,7 @@ def analyze_track(filepath):
         mix_out = max(0.0, analyzed_end - 30.0)  # fallback for short/odd tracks
 
         mix_candidates = []
+        mix_points = []
         intro_lead_bars = 0
         sections = []
         # mixOut sobre la GRILLA COMPLETA, no sobre los beats detectados: si
@@ -331,6 +371,36 @@ def analyze_track(filepath):
                         rise = vec[0] >= prev_vec[0] * 1.3 or vec[2] >= prev_vec[2] * 1.5
                         if soft and rise:
                             dips.append(b)
+                # ── MOMENTOS DE ENGANCHE POR PATRÓN ────────────────────────
+                # El filtro de arriba solo acepta "veníamos suaves y sube" = la
+                # subida al drop, y tira el resto: medido sobre 6 temas daba 8
+                # momentos donde la estructura tiene 21. Un DJ engancha sobre
+                # todo en la BAJADA (termina el drop, se va el bajo -> queda el
+                # hueco donde entra el tema nuevo). Acá se clasifica CADA
+                # frontera de frase y se guarda con tipo y puntaje, para poder
+                # elegir el momento en vez de tener uno solo impuesto.
+                t_b = float(grid_beats[b])
+                if prev_vec is not None and t_b > analyzed_end * 0.25 and t_b < analyzed_end - 20:
+                    f, l, h = vec
+                    pf, pl, ph = prev_vec
+                    tipo, score = None, 0.0
+                    if l < pl * 0.62 and pl > 0.5:
+                        # se cae el bajo: el hueco, el mejor punto de entrada
+                        tipo, score = "bajada", 1.0 + (pl - l)
+                    elif l < 0.4 and f < 0.85:
+                        # bloque sin graves sostenido: B entra con SU bajo
+                        tipo, score = "breakdown", 0.85
+                    elif pf <= 0.8 and (f >= pf * 1.3 or h >= ph * 1.5):
+                        tipo, score = "subida", 0.8 + (f - pf)
+                    elif t_b > analyzed_end * 0.66 and l < pl * 0.8:
+                        tipo, score = "outro", 0.7
+                    if tipo:
+                        mix_points.append({
+                            "t": round(t_b, 3),
+                            "bar": int((b - i0) // 4),
+                            "type": tipo,
+                            "score": round(float(score), 2),
+                        })
                 prev_vec = vec
             # mixIn v2 ("lo detectás mal y lo mandás sin entender cuándo tiene
             # que entrar"): la ENTRADA es el primer TREN de bombos sostenido en
@@ -354,7 +424,9 @@ def analyze_track(filepath):
                         melody_j = j
                         break
                 intro_lead_bars = max(0, round((kick_entry - melody_j) / 4))
-                mix_in = float(grid_beats[kick_entry])
+                # El punto de grilla cae en el PICO del bombo: entrar ahi es
+                # entrar con medio golpe consumido. El cue se lleva al ataque.
+                mix_in = _cue_attack(y, sr, float(grid_beats[kick_entry]), beat_len)
 
             cand = [e for e in dips if grid_beats[e] > analyzed_end * 0.5 and e < n - 8]
             mix_candidates = [float(grid_beats[e]) for e in cand]
@@ -408,6 +480,8 @@ def analyze_track(filepath):
                     mix_in += beat_len
                 mix_out += err
                 mix_candidates = [c + err for c in mix_candidates]
+                for _p in mix_points:
+                    _p["t"] = round(_p["t"] + err, 3)
 
         # Fade expressed in musical time: 8 bars, capped to end >=3 s before the track dies
         fade = min(8 * bar_len, max(4.0, analyzed_end - mix_out - 3.0))
@@ -423,6 +497,10 @@ def analyze_track(filepath):
                 # tienen al menos 2 momentos") — re-arranques de sección de la
                 # mitad final, para elegir entre ellos.
                 "outCandidates": [round(c, 3) for c in mix_candidates],
+                # Momentos de enganche CLASIFICADOS (bajada / breakdown /
+                # subida / outro), en fronteras de frase, ordenados por puntaje.
+                # El motor elige con cuál engancha y de cuántos compases.
+                "mixPoints": sorted(mix_points, key=lambda p: -p["score"])[:8],
                 # True = ningún candidato estructural pasó la vara de contraste:
                 # el punto es un fallback débil — marcar a mano con el Cue.
                 "outWeak": len(mix_candidates) == 0,
