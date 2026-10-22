@@ -24,8 +24,10 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_ROOT = Path(r"C:\Users\look\Music\groove-new\Audiolibros")
+LOOSE_EXTS = {".m4b", ".m4a"}  # No buscar MP3 aquí: puede haber miles de temas de DJ
+
 EXTS = {".m4b", ".m4a", ".mp3", ".flac", ".aac", ".ogg", ".opus", ".wav", ".wma", ".aiff", ".aif"}
 COVERS = {"cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png"}
 PART_PATTERN = re.compile(r"(?i)(?:^|[\s_\-.])(part(?:e)?|disc|disk|cd|track|cap(?:itulo|ítulo|ter)?|chapter)[\s_\-.]*0*(\d{1,3})(?:\b|$)")
@@ -57,7 +59,11 @@ def normalized(v):
 
 
 def identity_from_path(p, root):
-    rel = p.relative_to(root)
+    try:
+        rel = p.relative_to(root)
+    except ValueError:
+        # Copias sueltas en groove-new, un nivel ENCIMA de Audiolibros.
+        rel = Path(p.name)
     # Para archivos en carpetas dedicadas a una obra, el nombre de esa carpeta
     # suele ser más fiable que tags internos que a veces son de otro volumen.
     parent_is_category = normalized(rel.parent.name) in {"audiolibros", "audiobooks", "audio books", "books"}
@@ -104,12 +110,14 @@ def probe(p, ffprobe):
 
 
 def decode_entire(p, ffmpeg, timeout_hours=48):
-    """Lee/decodea del primer al último paquete. Tiempo por muestras, NO timestamps.
+    """Decodifica toda la pista: la duración sale de las muestras reproducidas.
 
-    -af asetpts=N/SR/TB hace que out_time mida muestras realmente decodificadas
-    aun si los timestamps del MP4 saltan o anuncian una duración ficticia.
+    NO usamos -xerror: un paquete defectuoso aislado no implica que TODO el
+    audiolibro esté truncado (p. ej. Leviathan Wakes). FFmpeg informa esas
+    anomalías en stderr; se guardan como ADVERTENCIA, no como fallo fatal,
+    siempre que llegue al final y la duración real coincida.
     """
-    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-v", "error", "-xerror",
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-v", "error",
            "-stats_period", "20", "-i", str(p), "-map", "0:a:0", "-vn", "-sn", "-dn",
            "-af", "asetpts=N/SR/TB", "-f", "null", "-", "-progress", "pipe:1"]
     try:
@@ -163,7 +171,13 @@ def inspect_one(p, root, ffmpeg, ffprobe, deep=True):
     except OSError as exc:
         return {"path": str(p), "state": "ERROR", "issues": [str(exc)]}
     key, author, display = identity_from_path(p, root)
-    record = {"path": str(p), "relative_path": str(p.relative_to(root)),
+    try:
+        rel_path = str(p.relative_to(root))
+        location = "BIBLIOTECA"
+    except ValueError:
+        rel_path = str(Path("..") / p.name)
+        location = "SUELTO_GROOVE_NEW"
+    record = {"path": str(p), "relative_path": rel_path, "location": location,
               "size": stat0.st_size, "mtime_ns": stat0.st_mtime_ns,
               "work_key": key, "author_key": author, "work": display,
               "state": "PENDIENTE", "issues": [], "warnings": [], "sha256": None}
@@ -212,9 +226,12 @@ def inspect_one(p, root, ffmpeg, ffprobe, deep=True):
     dec = decode_entire(p, ffmpeg)
     record.update(dec)
     if dec["decoder_rc"] != 0 or not dec["decoder_finished"] or dec["decoded_s"] is None:
-        record["issues"].append("No terminó decodificación completa sin errores")
+        record["issues"].append("FFmpeg no terminó la decodificación completa")
         if dec.get("decoder_error"):
             record["issues"].append(dec["decoder_error"][-700:])
+    elif dec.get("decoder_error"):
+        record["warnings"].append("FFmpeg informó errores de paquetes recuperables; revisar zonas afectadas: "
+                                  + dec["decoder_error"][-500:])
     decoded = dec.get("decoded_s")
     if decoded is not None:
         if decoded <= 0:
@@ -306,6 +323,68 @@ def duplicate_analysis(records, cache):
             probable.append({"paths": list(pair), "similarity": round(sim, 3),
                              "reason": "Título y duración parecidos, bytes no confirmados iguales; comparar narrador/edición"})
     return exact, probable
+
+
+def classify_file_roles(records, root):
+    """Separa los capítulos MP3/M4A de los libros completos: ambos se validan.
+
+    No omite pistas pequeñas. Un MP3 en una carpeta con varias pistas es una
+    PARTE, no otro libro; si sólo hay una pista, no adivinamos su papel.
+    """
+    by_folder = defaultdict(list)
+    explicit_parts = set()
+    for r in records:
+        by_folder[str(Path(r["path"]).parent)].append(r)
+    for manifest in root.rglob("libro.json"):
+        try:
+            doc = json.loads(manifest.read_text(encoding="utf-8"))
+            for item in doc.get("archivos") or []:
+                name = (item.get("nombre") or item.get("name") or item.get("archivo")) if isinstance(item, dict) else item
+                if isinstance(name, str) and name:
+                    explicit_parts.add(str((manifest.parent / Path(name.replace("\\", "/")).name).resolve()))
+        except (OSError, ValueError, TypeError):
+            continue
+    for r in records:
+        p = Path(r["path"])
+        siblings = by_folder[str(p.parent)]
+        other_audio = [x for x in siblings if Path(x["path"]).suffix.lower() != ".m4b"]
+        named_part = bool(PART_PATTERN.search(p.stem) or re.match(r"^0*\d{1,3}[\s_.-]+\D", p.stem))
+        in_manifest = str(p.resolve()) in explicit_parts
+        if p.suffix.lower() == ".m4b" or r.get("location") == "SUELTO_GROOVE_NEW":
+            role = "LIBRO_CANDIDATO"
+        elif in_manifest or named_part or (p.parent != root and len(other_audio) >= 2):
+            role = "PARTE"
+        else:
+            role = "ARCHIVO_UNICO_O_EDICION"
+        r["role"] = role
+        if role == "PARTE" and not in_manifest and not named_part:
+            r.setdefault("warnings", []).append("Parte inferida por agrupación de pistas; confirmar con libro.json")
+    return records
+
+
+def book_groups(records, root, missing_manifests, numbered_gaps):
+    """Resumen por carpeta/obra; las pistas individuales no son libros aparte."""
+    groups = defaultdict(list)
+    for r in records:
+        p = Path(r["path"])
+        if r.get("role") == "PARTE":
+            ident = "carpeta:" + str(p.parent)
+            label = p.parent.name
+        else:
+            ident = "obra:" + r.get("author_key", "") + ":" + r.get("work_key", "")
+            label = r.get("work") or p.stem
+        groups[(ident, label)].append(r)
+    result = []
+    for (_, label), entries in sorted(groups.items(), key=lambda kv: kv[0][1].casefold()):
+        any_fault = any(e.get("state") in {"ROTO", "ERROR", "ROTO_O_INCONSISTENTE", "MODIFICADO_DURANTE_LECTURA"} for e in entries)
+        parts = [e for e in entries if e.get("role") == "PARTE"]
+        result.append({"book": label, "files": [e["path"] for e in entries],
+                       "parts": len(parts), "candidates": len(entries) - len(parts),
+                       "status": "REVISAR_ARCHIVOS" if any_fault else
+                                 "PARTES_DECODIFICABLES_NO_CERTIFICA_COMPLETITUD" if parts else
+                                 "AUDIO_VERIFICADO_NO_CERTIFICA_COMPLETITUD",
+                       "caution": "La integridad técnica no garantiza que el libro tenga todos sus capítulos narrativos."})
+    return result
 
 
 def missing_parts(records):
@@ -417,7 +496,8 @@ def save_json(path, data):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Audita íntegramente audiolibros y duplicados sin borrar archivos")
     parser.add_argument("--root", default=DEFAULT_ROOT, type=Path, help=f"Carpeta de audiolibros (default: {DEFAULT_ROOT})")
-    parser.add_argument("--output", type=Path, help="Carpeta informes; default ROOT/_curador/_trabajo")
+    parser.add_argument("--output", type=Path, help="Carpeta de informes; por defecto afuera de groove-new, en Music/curador-chat-reportes")
+    parser.add_argument("--no-loose", action="store_true", help="No incluir M4B y M4A grandes sueltos en la raíz groove-new")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Ruta de ffmpeg.exe o nombre PATH")
     parser.add_argument("--ffprobe", default="ffprobe", help="Ruta de ffprobe.exe o nombre PATH")
     parser.add_argument("--metadata-only", action="store_true", help="Escaneo rápido; NO valida integridad de audio")
@@ -427,11 +507,11 @@ def main(argv=None):
     root = args.root.expanduser().resolve()
     if not root.is_dir():
         parser.error(f"No existe carpeta: {root}")
-    out = (args.output or root / "_curador" / "_trabajo").expanduser().resolve()
+    out = (args.output or root.parent.parent / "curador-chat-reportes").expanduser().resolve()
     ffmpeg = binary(args.ffmpeg)
     ffprobe = binary(args.ffprobe)
     engine = ff_version(ffmpeg) + " | " + ff_version(ffprobe)
-    mode = ("meta" if args.metadata_only else "full") + ":audiobooks"
+    mode = ("meta" if args.metadata_only else "full") + (":solo-biblioteca" if args.no_loose else ":incluye-sueltos")
     state_path = out / "cache_curador.json"
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -447,8 +527,15 @@ def main(argv=None):
             return False
         rel_parts = p.relative_to(root).parts[:-1]
         return not any(part.lower() in excluded_dirs for part in rel_parts)
-    files = sorted((p for p in root.rglob("*") if in_scope(p)), key=lambda p: str(p).casefold())
-    print(f"Archivos: {len(files)} | modo: {mode} | raíz: {root}", flush=True)
+    files = [p for p in root.rglob("*") if in_scope(p)]
+    if not args.no_loose and root.parent.is_dir():
+        # Solo hijos inmediatos: no atravesar la biblioteca general de música/DJ.
+        for p in root.parent.iterdir():
+            if p.is_file() and not p.is_symlink() and p.suffix.lower() in LOOSE_EXTS:
+                if p.suffix.lower() == ".m4b" or p.stat().st_size >= 50 * 1000 * 1000:
+                    files.append(p)
+    files = sorted(set(files), key=lambda p: str(p).casefold())
+    print(f"Archivos: {len(files)} | modo: {mode} | raíz: {root} | informes: {out}", flush=True)
     records = []
     for idx, p in enumerate(files, start=1):
         try:
@@ -481,18 +568,21 @@ def main(argv=None):
         if r.get("sha256") and str(r["path"]) in cache:
             cache[str(r["path"])]["sha256"] = r["sha256"]
     save_json(state_path, {"version": VERSION, "engine": engine, "records": cache})
+    classify_file_roles(records, root)
     missing = missing_parts(records)
     missing_manifest = missing_manifest_parts(root, records)
+    grouped_books = book_groups(records, root, missing_manifest, missing)
     conflicts = title_conflicts(records)
     results = {"timestamp_utc": datetime.now(timezone.utc).isoformat(), "version": VERSION, "root": str(root),
                "mode": mode, "warning": "Integridad técnica NO certifica contenido narrativo completo sin referencia editorial",
-               "total_files": len(records), "files": records, "exact_duplicates": exact, "possible_duplicates": probable,
+               "total_files": len(records), "files": records, "books": grouped_books,
+               "exact_duplicates": exact, "possible_duplicates": probable,
                "missing_numbered_parts": missing, "missing_manifest_parts": missing_manifest,
                "same_title_different_duration": conflicts,
                "suggested_decisions": decisions(records, exact, probable)}
     save_json(out / "auditoria.json", results)
     with (out / "auditoria.csv").open("w", encoding="utf-8-sig", newline="") as fd:
-        w = csv.DictWriter(fd, fieldnames=["state", "relative_path", "size", "declared_s", "decoded_s", "chapters", "chapter_end_s", "cover", "issues", "warnings"])
+        w = csv.DictWriter(fd, fieldnames=["state", "role", "location", "relative_path", "size", "declared_s", "decoded_s", "chapters", "chapter_end_s", "cover", "issues", "warnings"])
         w.writeheader()
         for rec in records:
             w.writerow({k: (" | ".join(rec.get(k, [])) if k in ("issues", "warnings") else rec.get(k, "")) for k in w.fieldnames})
@@ -502,6 +592,9 @@ def main(argv=None):
         summary[rec["state"]] += 1
     for k, n in sorted(summary.items()):
         print(f"  {k}: {n}")
+    print(f"  Obras/carpetas identificadas: {len(grouped_books)}")
+    print(f"  Pistas identificadas como PARTES: {sum(1 for r in records if r.get('role') == 'PARTE')}")
+    print(f"  Copias sueltas revisadas: {sum(1 for r in records if r.get('location') == 'SUELTO_GROOVE_NEW')}")
     print(f"  Grupos duplicados EXACTOS: {len(exact)}")
     print(f"  Pares de POSIBLES duplicados: {len(probable)}")
     print(f"  Secuencias numeradas con huecos: {len(missing)}")
